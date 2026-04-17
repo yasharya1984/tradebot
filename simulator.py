@@ -9,13 +9,14 @@ Compare all strategies side-by-side to find the best performer.
 """
 
 import logging
+import time
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
 
-from config import CAPITAL, BACKTEST_PERIOD_DAYS
+from config import CAPITAL, BACKTEST_PERIOD_DAYS, EMA_PERIOD, EMA_TIMEFRAME, STOP_LOSS_PCT
 from data_fetcher import DataFetcher
 from portfolio import Portfolio, Position
 from stock_selector import StockSelector
@@ -79,30 +80,58 @@ class Simulator:
 
         strategy = StrategyClass()
         signals_df = strategy.generate_signals(df)
+
+        # Pre-compute 20-period EMA on daily close for the EMA exit filter
+        signals_df = signals_df.copy()
+        signals_df["EMA20"] = signals_df["Close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+
         result.signals_df = signals_df
 
-        for i, (date, row) in enumerate(signals_df.iterrows()):
-            price = float(row["Close"])
-            signal = row.get("Signal", "HOLD")
+        for date, row in signals_df.iterrows():
+            close_price = float(row["Close"])
+            open_price  = float(row.get("Open", close_price))
+            signal      = row.get("Signal", "HOLD")
+            ema20       = float(row["EMA20"])
 
-            # Update trailing stops for open positions
             if symbol in portfolio.positions:
                 pos = portfolio.positions[symbol]
-                trailing_triggered = pos.update_trailing_stop(price)
 
-                # Check exit conditions
+                # ── Gap-Down Handling ──────────────────────────────────────
+                # If the daily Open is below the current stop loss, give the
+                # stock a chance to recover within that candle before exiting.
+                if open_price < pos.stop_loss:
+                    candle_green = close_price > open_price
+                    if candle_green:
+                        # Recovery: tighten SL to the candle's Low and hold
+                        new_sl = float(row["Low"])
+                        if new_sl > pos.entry_price * (1 - STOP_LOSS_PCT * 2):
+                            pos.stop_loss = new_sl
+                        pos.gap_state = "recovered"
+                        portfolio._record_equity()
+                        continue  # Don't exit — gap filled
+                    else:
+                        # Red candle after gap down: exit at open
+                        portfolio.close_position(symbol, open_price, "Gap Down Exit", date)
+                        portfolio._record_equity()
+                        continue
+
+                # ── Dynamic Trailing Stop ─────────────────────────────────
+                trailing_triggered = pos.update_trailing_stop(close_price)
+
+                # ── Exit Conditions (priority order) ─────────────────────
                 if trailing_triggered:
-                    portfolio.close_position(symbol, price, "Trailing Stop", date)
-                elif pos.should_stop_loss(price):
-                    portfolio.close_position(symbol, price, "Stop Loss", date)
-                elif pos.should_take_profit(price):
-                    portfolio.close_position(symbol, price, "Take Profit", date)
+                    portfolio.close_position(symbol, close_price, "Trailing Stop", date)
+                elif pos.should_stop_loss(close_price):
+                    portfolio.close_position(symbol, close_price, "Stop Loss", date)
+                elif close_price < ema20:
+                    # Price closed below 20 EMA — secondary exit filter
+                    portfolio.close_position(symbol, close_price, "EMA Exit", date)
                 elif signal == "SELL":
-                    portfolio.close_position(symbol, price, "Strategy Signal", date)
+                    portfolio.close_position(symbol, close_price, "Strategy Signal", date)
 
             # Open new position on BUY signal
-            elif signal == "BUY" and symbol not in portfolio.positions:
-                portfolio.open_position(symbol, price, strategy_name, date)
+            elif signal == "BUY":
+                portfolio.open_position(symbol, close_price, strategy_name, date)
 
             portfolio._record_equity()
 
@@ -227,8 +256,11 @@ class Simulator:
     ):
         """
         Set up paper trading portfolios (one per strategy).
-        Loads previously saved state from disk (mode-specific) if available
-        so trades survive application restarts.
+
+        Loads previously saved JSON state from disk immediately (fast, no network
+        calls) so the dashboard can render the last-known portfolio without waiting
+        for yfinance.  Stock selection is left empty here and populated lazily on
+        the first call to paper_trading_tick() so the UI is never blocked.
         """
         self._trade_mode = mode
         names = strategy_names or list(STRATEGY_MAP.keys())
@@ -248,11 +280,13 @@ class Simulator:
             else:
                 self._paper_portfolios[name] = Portfolio(CAPITAL)
 
-        # Lock in the stock selection at startup so it doesn't change mid-session
-        self._paper_selected, _ = self.selector.refresh_selection()
+        # NOTE: refresh_selection() intentionally NOT called here.
+        # Stock selection is expensive (300 yfinance calls) and would block the
+        # dashboard render.  It is populated lazily on the first tick in a
+        # background thread so the UI shows data immediately.
         logger.info(
-            f"Paper trading [{mode}] initialized for strategies: {names} | "
-            f"Stocks locked: {[s['symbol'] for s in self._paper_selected]}"
+            f"Paper trading [{mode}] initialized for strategies: {names} "
+            "(stock selection deferred to first tick)"
         )
 
     def reset_paper_trading(
@@ -336,28 +370,110 @@ class Simulator:
         tick_results = {}
         mode = self._trade_mode
 
+        # IST time — used for gap-down timed-exit logic
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(IST)
+        # True during the opening 15-min bar (9:15–9:30 AM)
+        is_opening_window = now_ist.hour == 9 and 15 <= now_ist.minute < 30
+        # True once the first 15-min bar has closed (≥ 9:30 AM)
+        is_post_first_bar = (now_ist.hour == 9 and now_ist.minute >= 30) or now_ist.hour > 9
+
+        symbols = [s["symbol"] for s in selected]
+
+        # ── Batch-fetch historical data for ALL selected stocks ────────
+        # One yf.download() call replaces N individual Ticker.history() calls.
+        historical_batch = self.fetcher.get_multiple_historical_batch(
+            symbols, period_days=60
+        )
+
+        # ── Batch-fetch current prices for ALL selected stocks ─────────
+        live_prices = self.fetcher.get_multiple_prices_fast(symbols)
+
+        # ── Intraday (15-min) data — only for open positions ──────────
+        # Limits the expensive intraday calls to at most MAX_OPEN_POSITIONS.
+        open_symbols = list(portfolio.positions.keys())
+        intraday_cache: Dict[str, pd.DataFrame] = {}
+        for _sym in open_symbols:
+            intraday_cache[_sym] = self.fetcher.get_intraday(_sym, interval=EMA_TIMEFRAME)
+
         for stock_info in selected:
             symbol = stock_info["symbol"]
-            df = self.fetcher.get_historical(symbol, period_days=60)
-            if df.empty:
+            df = historical_batch.get(symbol)
+            if df is None or df.empty:
                 continue
 
-            current_price = self.fetcher.get_current_price(symbol) or float(df["Close"].iloc[-1])
+            current_price = live_prices.get(symbol) or float(df["Close"].iloc[-1])
             signal = strategy.get_current_signal(df)
+
+            # ── 15-min intraday data (already fetched above for open positions) ──
+            intraday = intraday_cache.get(symbol, pd.DataFrame())
+
+            # Compute 15-min 20-EMA and check if last close is below it
+            ema_exit = False
+            if intraday is not None and len(intraday) >= EMA_PERIOD:
+                intraday = intraday.copy()
+                intraday["EMA20"] = intraday["Close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+                last_close_15m = float(intraday["Close"].iloc[-1])
+                last_ema_15m   = float(intraday["EMA20"].iloc[-1])
+                ema_exit = last_close_15m < last_ema_15m
 
             # Process exits — log each close to bot_orders
             if symbol in portfolio.positions:
                 pos = portfolio.positions[symbol]
-                trailing_triggered = pos.update_trailing_stop(current_price)
                 reason = None
-                if trailing_triggered:
-                    reason = "Trailing Stop"
-                elif pos.should_stop_loss(current_price):
-                    reason = "Stop Loss"
-                elif pos.should_take_profit(current_price):
-                    reason = "Take Profit"
-                elif signal == "SELL":
-                    reason = "Strategy Signal"
+
+                # ── Gap-Down Timed Exit Logic ──────────────────────────────
+                if current_price < pos.stop_loss and pos.gap_state == "none" and is_opening_window:
+                    # Gap detected at open — start watching; do NOT exit yet
+                    pos.gap_state = "watching"
+                    pos.gap_down_open = current_price
+                    tick_results[symbol] = {
+                        "signal": "GAP_WATCH", "price": current_price, "in_position": True
+                    }
+                    continue
+
+                elif pos.gap_state == "watching" and is_post_first_bar:
+                    # First 15-min candle has closed — decide now
+                    if intraday is not None and not intraday.empty:
+                        first_candle = intraday.iloc[0]
+                        candle_green    = float(first_candle["Close"]) > float(first_candle["Open"])
+                        avg_vol         = float(intraday["Volume"].mean()) if len(intraday) > 1 else float(first_candle["Volume"])
+                        is_high_volume  = avg_vol > 0 and float(first_candle["Volume"]) > avg_vol * 1.5
+
+                        if candle_green and current_price > float(first_candle["Low"]):
+                            # Recovery: hold and tighten SL to opening candle low
+                            pos.stop_loss = max(
+                                float(first_candle["Low"]),
+                                pos.entry_price * (1 - STOP_LOSS_PCT * 2),
+                            )
+                            pos.gap_state = "recovered"
+                        else:
+                            # Red candle or high-volume flush: exit immediately
+                            reason = "Gap Down Exit"
+                    else:
+                        reason = "Stop Loss"  # No intraday data — fall back
+
+                elif pos.gap_state not in ("watching", "recovered"):
+                    # ── Dynamic Trailing Stop ─────────────────────────────
+                    trailing_triggered = pos.update_trailing_stop(current_price)
+
+                    if trailing_triggered:
+                        reason = "Trailing Stop"
+                    elif pos.should_stop_loss(current_price):
+                        reason = "Stop Loss"
+                    elif ema_exit:
+                        reason = "EMA Exit"
+                    elif signal == "SELL":
+                        reason = "Strategy Signal"
+                else:
+                    # gap_state == "watching" (still in opening window) or "recovered" — run normal checks
+                    trailing_triggered = pos.update_trailing_stop(current_price)
+                    if trailing_triggered:
+                        reason = "Trailing Stop"
+                    elif ema_exit:
+                        reason = "EMA Exit"
+                    elif signal == "SELL":
+                        reason = "Strategy Signal"
 
                 if reason:
                     trade = portfolio.close_position(symbol, current_price, reason)
@@ -382,19 +498,26 @@ class Simulator:
                         pass
 
             tick_results[symbol] = {
-                "signal":        signal,
-                "price":         current_price,
-                "in_position":   symbol in portfolio.positions,
+                "signal":      signal,
+                "price":       current_price,
+                "in_position": symbol in portfolio.positions,
             }
 
         current_prices = {s: tick_results[s]["price"] for s in tick_results}
         portfolio._record_equity(current_prices)
 
-        # Persist state to disk so it survives app restarts
+        # Persist portfolio state to disk so it survives app restarts
         try:
             trade_store.save_portfolio(strategy_name, portfolio.to_dict(), mode=mode)
         except Exception as exc:
             logger.warning(f"Failed to persist portfolio [{strategy_name}]: {exc}")
+
+        # Persist live prices so the dashboard can show them before the next
+        # tick completes (avoids falling back to entry prices on restart).
+        try:
+            trade_store.save_last_prices(current_prices, mode=mode)
+        except Exception as exc:
+            logger.warning(f"Failed to persist prices [{strategy_name}]: {exc}")
 
         return {
             "strategy":     strategy_name,
@@ -465,8 +588,8 @@ class Simulator:
                 quantity      = int(quantity),
                 entry_date    = datetime.now(),
                 strategy      = strategy_name,
-                stop_loss     = float(avg_price) * (1 - 0.02),
-                target        = float(avg_price) * (1 + 0.04),
+                stop_loss     = float(avg_price) * (1 - STOP_LOSS_PCT),
+                target        = None,   # Dynamic TSL handles exits
                 highest_price = float(avg_price),
             )
             portfolio.positions[symbol_ns] = new_pos

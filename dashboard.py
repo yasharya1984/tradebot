@@ -51,6 +51,10 @@ st.set_page_config(
 # ──────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+/* ── Universal background baseline — covers every Streamlit version ── */
+html, body { background: #eef2f8 !important; color: #1e2a3a !important; }
+[data-testid="stApp"], .stApp { background: #eef2f8 !important; color: #1e2a3a !important; }
+
 /* ── Hide top toolbar (deploy button, three-dot menu) entirely ── */
 [data-testid="stDeployButton"]          { display: none !important; }
 [data-testid="stToolbarActions"]        { display: none !important; }
@@ -467,10 +471,14 @@ def init_session():
             st.session_state[f"_tick_done_event_{_m}"] = threading.Event()
             st.session_state[f"_tick_result_{_m}"]     = {}
             st.session_state[f"_bot_start_time_{_m}"]  = None
+            # "initial" = no live tick yet (may have disk-cached prices)
+            # "synced"  = at least one live tick completed
+            st.session_state[f"_price_state_{_m}"]     = "initial"
+            # Last prices written by save_last_prices() — loaded from disk
+            # immediately so positions show real prices before the first tick.
+            st.session_state[f"_cached_prices_{_m}"]   = trade_store.load_last_prices(_m)
         st.session_state._kite_trader          = None
         # _view_mode = what we're currently DISPLAYING ("sim" or "live")
-        # Both modes can run simultaneously; this is just the view toggle.
-        # Seed from query params so a page refresh restores the last state.
         _valid_pages = {"trading", "overview", "history", "screener", "backtest", "settings"}
         st.session_state._view_mode = st.query_params.get("mode", "sim") if st.query_params.get("mode") in ("sim", "live") else "sim"
         st.session_state._nav_page  = st.query_params.get("page", "trading") if st.query_params.get("page") in _valid_pages else "trading"
@@ -481,6 +489,11 @@ def init_session():
             "STOP_LOSS_PCT":             config.STOP_LOSS_PCT,
             "TARGET_PCT":                config.TARGET_PCT,
             "TRAILING_STOP_PCT":         config.TRAILING_STOP_PCT,
+            "BREAKEVEN_TRIGGER_PCT":     config.BREAKEVEN_TRIGGER_PCT,
+            "TSL_ACTIVATION_PCT":        config.TSL_ACTIVATION_PCT,
+            "EMA_PERIOD":                config.EMA_PERIOD,
+            "MIN_POSITION_VALUE":        config.MIN_POSITION_VALUE,
+            "MIN_PNL_TO_BOOK":           config.MIN_PNL_TO_BOOK,
             "MAX_OPEN_POSITIONS":        config.MAX_OPEN_POSITIONS,
             "MAX_POSITION_PCT":          config.MAX_POSITION_PCT,
             "MA_SHORT_PERIOD":           config.MA_SHORT_PERIOD,
@@ -495,6 +508,47 @@ def init_session():
         }
         st.session_state.config_sim  = dict(_default_cfg)
         st.session_state.config_live = dict(_default_cfg)
+
+        # ── Auto-start: if saved portfolios exist on disk, restore and start bot ──
+        for _m in ("sim", "live"):
+            _saved_strategies = trade_store.list_saved_strategies(_m)
+            if not _saved_strategies:
+                continue
+            _sim_inst = (
+                st.session_state.simulator_live if _m == "live"
+                else st.session_state.simulator_sim
+            )
+            try:
+                # Load all saved strategies into the simulator
+                _sim_inst.initialize_paper_trading(_saved_strategies, mode=_m)
+                # Build restored results dict so the UI shows data immediately
+                _restored = {}
+                for _strat in _saved_strategies:
+                    _port = _sim_inst.get_paper_portfolio(_strat)
+                    if _port:
+                        _cp = {sym: pos.entry_price for sym, pos in _port.positions.items()}
+                        _restored[_strat] = {
+                            "strategy":  _strat,
+                            "timestamp": "auto-restored",
+                            "signals":   {},
+                            "portfolio": {
+                                "cash":      round(_port.cash, 2),
+                                "equity":    round(_port.total_equity(_cp), 2),
+                                "pnl":       round(_port.total_pnl(_cp), 2),
+                                "pnl_pct":   round(_port.total_pnl_pct(_cp), 2),
+                                "positions": len(_port.positions),
+                            },
+                        }
+                if _restored:
+                    st.session_state[f"paper_results_{_m}"] = _restored
+                    st.session_state[f"paper_running_{_m}"] = True
+                    st.session_state[f"_bot_start_time_{_m}"] = datetime.now()
+                    logger.info(
+                        f"Auto-started [{_m}] bot with {len(_saved_strategies)} "
+                        f"saved strategy portfolios"
+                    )
+            except Exception as _ae:
+                logger.warning(f"Auto-start failed for [{_m}]: {_ae}")
 
 init_session()
 
@@ -601,6 +655,8 @@ def _save_mode_config(mode: str) -> None:
     """Snapshot current config module values back into the per-mode store."""
     _keys = [
         "CAPITAL", "STOP_LOSS_PCT", "TARGET_PCT", "TRAILING_STOP_PCT",
+        "BREAKEVEN_TRIGGER_PCT", "TSL_ACTIVATION_PCT", "EMA_PERIOD",
+        "MIN_POSITION_VALUE", "MIN_PNL_TO_BOOK",
         "MAX_OPEN_POSITIONS", "MAX_POSITION_PCT", "MA_SHORT_PERIOD",
         "MA_LONG_PERIOD", "RSI_PERIOD", "RSI_OVERSOLD", "RSI_OVERBOUGHT",
         "MOMENTUM_LOOKBACK", "TOP_N_STOCKS", "LIVE_TRADING_CAP",
@@ -701,7 +757,7 @@ _JS_CLOCK = """
   function getIST(){return new Date(Date.now()+5.5*3600000);}
   function mktInfo(ist){
     var wd=ist.getUTCDay(),h=ist.getUTCHours(),m=ist.getUTCMinutes(),mins=h*60+m;
-    if(wd===0||wd===6)return{s:'CLOSED',c:'#ff6060',l:'Weekend'};
+    if(wd===0||wd===6)return{s:'CLOSED',c:'#ff6060',l:'Weekend — closed'};
     if(mins>=555&&mins<=930){var r=930-mins;return{s:'OPEN',c:'#50e880',l:'Closes in '+Math.floor(r/60)+'h '+(r%60)+'m'};}
     if(mins>=540&&mins<555){var r2=555-mins;return{s:'PRE-OPEN',c:'#f0b429',l:'Opens in '+r2+'m'};}
     if(mins<540){var r3=555-mins;return{s:'CLOSED',c:'#ff6060',l:'Opens in '+Math.floor(r3/60)+'h '+(r3%60)+'m'};}
@@ -716,13 +772,74 @@ _JS_CLOCK = """
     ['sb-mkt-status','hero-mkt-status'].forEach(function(id){var e=document.getElementById(id);if(e){e.innerText='● '+mi.s;e.style.color=mi.c;}});
     ['sb-mkt-label','hero-mkt-label'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=mi.l;});
   }
-  if(window._istTick)clearInterval(window._istTick);
-  window._istTick=setInterval(tick,1000);
-  tick();
+  /* Start the clock only after the required DOM nodes are present.
+     Streamlit may hydrate the sidebar after the main content, so we
+     retry up to 20 times (×200 ms = 4 s) before starting unconditionally. */
+  function startClock(){
+    if(window._istTick)clearInterval(window._istTick);
+    window._istTick=setInterval(tick,1000);
+    tick();
+  }
+  var _clockRetries=20;
+  var _clockWait=setInterval(function(){
+    _clockRetries--;
+    if(document.getElementById('sb-mkt-status')||_clockRetries<=0){
+      clearInterval(_clockWait);
+      startClock();
+    }
+  },200);
 })();
 </script>
 """
 
+
+_JS_CONNECTIVITY = """
+<script>
+(function(){
+  /* Connectivity watchdog — shows a fixed bottom-right banner when offline.
+     Uses navigator.onLine (instant) + a lightweight fetch probe (reliable). */
+  function _getOrCreateBanner(){
+    var b=document.getElementById('connectivity-banner');
+    if(!b){
+      b=document.createElement('div');
+      b.id='connectivity-banner';
+      b.style.cssText='position:fixed;bottom:20px;right:20px;z-index:99999;'
+        +'padding:10px 18px;border-radius:8px;font-size:0.85rem;font-weight:700;'
+        +'display:none;box-shadow:0 4px 16px rgba(139,26,26,0.25);'
+        +'transition:opacity 0.3s ease;';
+      document.body.appendChild(b);
+    }
+    return b;
+  }
+  function _showOffline(){
+    var b=_getOrCreateBanner();
+    b.style.display='block';
+    b.style.background='#fde8e8';
+    b.style.border='1px solid #f4a0a0';
+    b.style.color='#8b1a1a';
+    b.innerHTML='&#9888;&#65039; <strong>Connectivity Issue</strong> — Check your internet connection';
+  }
+  function _showOnline(){
+    var b=document.getElementById('connectivity-banner');
+    if(b)b.style.display='none';
+  }
+  function _probe(){
+    if(!navigator.onLine){_showOffline();return;}
+    /* Fetch a tiny resource with a short timeout to verify real reachability. */
+    var ctrl=new AbortController();
+    var tid=setTimeout(function(){ctrl.abort();},4000);
+    fetch('https://www.google.com/generate_204',{method:'HEAD',mode:'no-cors',cache:'no-store',signal:ctrl.signal})
+      .then(function(){clearTimeout(tid);_showOnline();})
+      .catch(function(){clearTimeout(tid);_showOffline();});
+  }
+  window.addEventListener('online', _probe);
+  window.addEventListener('offline',_showOffline);
+  if(window._connCheck)clearInterval(window._connCheck);
+  window._connCheck=setInterval(_probe,10000);
+  _probe();
+})();
+</script>
+"""
 
 # ──────────────────────────────────────────────────────────
 # Sidebar
@@ -876,6 +993,7 @@ st.markdown(
       </div>
     </div>
     {_JS_CLOCK}
+    {_JS_CONNECTIVITY}
     """,
     unsafe_allow_html=True,
 )
@@ -947,7 +1065,15 @@ if _page == "trading":
         format_func=lambda x: STRATEGY_MAP[x].name,
     )
     st.session_state._strategies_to_run = strategies_to_run
-    refresh_secs = ctrl2.number_input("Refresh (s)", 10, 300, config.DASHBOARD_REFRESH_SECONDS, step=10)
+    # Cache the refresh interval in session state so the fragment timer
+    # doesn't reset every time an unrelated widget fires a full-page rerun.
+    _cached_refresh = int(st.session_state.get(
+        f"_refresh_secs_{_vm}", config.DASHBOARD_REFRESH_SECONDS
+    ))
+    refresh_secs = int(ctrl2.number_input(
+        "Refresh (s)", 10, 300, _cached_refresh, step=10
+    ))
+    st.session_state[f"_refresh_secs_{_vm}"] = refresh_secs
 
     _is_running = st.session_state.get(f"paper_running_{_vm}", False)
     start_paper = ctrl3.button(
@@ -1019,7 +1145,7 @@ if _page == "trading":
     # ══════════════════════════════════════════════════════
     # Live-refreshing fragment — handles BOTH modes in parallel
     # ══════════════════════════════════════════════════════
-    @st.fragment(run_every=refresh_secs)
+    @st.fragment(run_every=int(refresh_secs))
     def _paper_live_view():
         _frag_vm   = st.session_state.get("_view_mode", "sim")
         _frag_live = (_frag_vm == "live")
@@ -1035,9 +1161,17 @@ if _page == "trading":
             # Promote finished results
             if _de.is_set():
                 _de.clear()
-                st.session_state[f"paper_results_{_mode}"] = dict(_rc)
+                _new_results = dict(_rc)
+                st.session_state[f"paper_results_{_mode}"] = _new_results
                 st.session_state[f"paper_ticks_{_mode}"]  += 1
                 st.session_state[f"_bg_last_update_{_mode}"] = datetime.now()
+                # First completed tick → prices are now live
+                st.session_state[f"_price_state_{_mode}"] = "synced"
+                # Keep the in-memory price cache in sync so subsequent renders
+                # always have the freshest prices available immediately.
+                for _sr_v in _new_results.values():
+                    for _sym_p, _info_p in _sr_v.get("signals", {}).items():
+                        st.session_state[f"_cached_prices_{_mode}"][_sym_p] = _info_p["price"]
             # Launch next tick if thread is idle
             _th = st.session_state.get(f"_bg_thread_{_mode}")
             if _th is None or not _th.is_alive():
@@ -1072,12 +1206,38 @@ if _page == "trading":
             if _other_running else ""
         )
 
+        _price_state = st.session_state.get(f"_price_state_{_frag_vm}", "initial")
         if _paper_running:
+            # Compute real time remaining until next auto-refresh
+            _frag_refresh = int(st.session_state.get(
+                f"_refresh_secs_{_frag_vm}", refresh_secs
+            ))
+            if _last:
+                _elapsed = (datetime.now() - _last).total_seconds()
+                _until_next = max(0, int(_frag_refresh - _elapsed))
+            else:
+                _until_next = _frag_refresh
             _dot = "⟳ fetching…" if _fetch else "✓ live"
+
+            if _price_state == "initial":
+                _n_disk = len(st.session_state.get(f"_cached_prices_{_frag_vm}", {}))
+                if _n_disk > 0:
+                    st.info(
+                        f"🕐 **Showing last synced prices** ({_n_disk} symbols) — "
+                        "live refresh in progress in the background."
+                    )
+                else:
+                    st.info(
+                        "⏳ **Fetching live prices in background** — "
+                        "no prior sync found; values shown are entry prices until "
+                        "the first market sync completes."
+                    )
             st.caption(
                 f"{_dot}  ·  Last update: {_ts_str}  "
                 f"·  Tick #{_ticks}  "
-                f"·  Next refresh in ~{refresh_secs}s{_parallel_note}"
+                f"·  Next refresh in ~{_until_next}s"
+                + ("  ·  📡 Prices: cached" if _price_state == "initial" else "  ·  📡 Prices: live")
+                + _parallel_note
             )
         elif _ticks > 0 or _paper_results:
             st.caption(f"⏸ Paused  ·  Last update: {_ts_str}  ·  Tick #{_ticks}{_parallel_note}")
@@ -1098,11 +1258,19 @@ if _page == "trading":
             st.session_state.simulator_live if _frag_live else st.session_state.simulator_sim
         )
 
-        # Global live price lookup: symbol_ns → latest price from strategy signals
-        _all_live_prices: dict = {}
+        # ── Build the effective price table (three-layer fallback) ──────
+        # Layer 1 (lowest priority): disk-cached prices from last yfinance sync.
+        #          Populated by save_last_prices() at the end of every tick and
+        #          loaded from disk at startup — always non-empty after the first
+        #          time the bot has ever run.
+        # Layer 2: prices from the current tick's signals (override disk cache).
+        # Layer 3: entry price used only if neither layer has the symbol.
+        _disk_prices: dict = st.session_state.get(f"_cached_prices_{_frag_vm}", {})
+
+        _all_live_prices: dict = dict(_disk_prices)   # start with disk
         for _sr_v in _sim_results.values():
             for _sym_lp, _info_lp in _sr_v.get("signals", {}).items():
-                _all_live_prices[_sym_lp] = _info_lp["price"]
+                _all_live_prices[_sym_lp] = _info_lp["price"]  # tick overrides disk
 
         # ══════════════════════════════════════════════════
         # SECTION A: Portfolio Status
@@ -1176,7 +1344,6 @@ if _page == "trading":
             # ─── Sim: Shared-capital Portfolio Status ────────
             st.subheader("📊 Portfolio Status")
 
-            _total_capital    = float(config.CAPITAL)
             _strat_breakdown  = []
             _total_in_order   = 0.0
             _total_unrealized = 0.0
@@ -1209,10 +1376,20 @@ if _page == "trading":
                     "realized":   _realized,
                 })
 
-            _free_capital = _total_capital - _total_in_order
+            # Total Capital = starting capital + all closed-trade P&L booked so far.
+            # Realized gains are added immediately when a trade closes.
+            _total_capital = float(config.CAPITAL) + _total_realized
+            _free_capital  = _total_capital - _total_in_order
 
             _am1, _am2, _am3, _am4 = st.columns(4)
-            _am1.metric("Total Capital", f"₹{_total_capital:,.0f}")
+            _am1.metric(
+                "Total Capital",
+                f"₹{_total_capital:,.0f}",
+                delta=(
+                    f"₹{_total_realized:+,.0f} realized"
+                    if abs(_total_realized) >= 1 else None
+                ),
+            )
             _am2.metric(
                 "In-Order Capital",
                 f"₹{_total_in_order:,.0f}",
@@ -1223,10 +1400,22 @@ if _page == "trading":
             )
             _am3.metric("Free Capital", f"₹{_free_capital:,.0f}")
             _pnl_total = _total_realized + _total_unrealized
-            _am4.metric(
-                "Total P&L",
-                f"₹{_pnl_total:+,.0f}",
-                delta=f"₹{_total_realized:+,.0f} realized  ·  ₹{_total_unrealized:+,.0f} open",
+            _pnl_fg = "#145c2e" if _pnl_total >= 0 else "#8b1a1a"
+            _pnl_bg = "#e6f9ee" if _pnl_total >= 0 else "#fde8e8"
+            _pnl_border = "#a3d9b7" if _pnl_total >= 0 else "#f4a0a0"
+            _am4.markdown(
+                f'<div style="background:{_pnl_bg};border:1px solid {_pnl_border};'
+                f'border-radius:12px;padding:16px 20px;'
+                f'box-shadow:0 2px 8px rgba(26,79,138,0.08)">'
+                f'<div style="color:#4a6080;font-size:0.78rem;font-weight:600;'
+                f'letter-spacing:0.02em">Total P&amp;L</div>'
+                f'<div style="color:{_pnl_fg};font-weight:700;font-size:1.5rem;margin:4px 0">'
+                f'&#8377;{_pnl_total:+,.0f}</div>'
+                f'<div style="color:#6a8090;font-size:0.75rem">'
+                f'&#8377;{_total_realized:+,.0f}&nbsp;realized'
+                f'&nbsp;&middot;&nbsp;&#8377;{_total_unrealized:+,.0f}&nbsp;open</div>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
 
             st.divider()
@@ -1317,7 +1506,7 @@ if _page == "trading":
             _TW = [2, 2, 1, 2, 2, 2, 2, 2, 1, 2, 2]
             _HDRS = [
                 "Stock", "Strategy", "Qty", "Entry ₹", "Curr / Exit ₹",
-                "P&L ₹", "Stop Loss ₹", "Target ₹", "Age", "Status", "Action",
+                "P&L ₹", "Stop Loss ₹", "Exit State", "Age", "Status", "Action",
             ]
             _hrow = st.columns(_TW)
             for _hcol, _hlbl in zip(_hrow, _HDRS):
@@ -1343,17 +1532,41 @@ if _page == "trading":
 
                 _pos_obj = _port_positions.get((_strat_k, _sym_ns))
                 if _status == "OPEN" and _pos_obj:
-                    _lp     = _all_live_prices.get(_sym_ns, _pos_obj.entry_price)
-                    _pnl_v  = (_lp - _pos_obj.entry_price) * _pos_obj.quantity
-                    _curr_s = f"₹{_lp:,.2f}"
+                    # True if we have any real price (disk cache or live tick)
+                    _has_any_price   = _sym_ns in _all_live_prices
+                    # True only if the current tick (not disk cache) provided it
+                    _is_live_price   = (
+                        _sym_ns in {
+                            sym
+                            for sr_v in _sim_results.values()
+                            for sym in sr_v.get("signals", {})
+                        }
+                    )
+                    _lp    = _all_live_prices.get(_sym_ns, _pos_obj.entry_price)
+                    _pnl_v = (_lp - _pos_obj.entry_price) * _pos_obj.quantity
+                    if _is_live_price:
+                        _curr_s = f"₹{_lp:,.2f}"           # fresh from tick
+                    elif _has_any_price:
+                        _curr_s = f"₹{_lp:,.2f} 🕐"       # from disk cache (last sync)
+                    else:
+                        _curr_s = f"₹{_lp:,.2f} ⏳"       # fallback: entry price
                     _sl_s   = f"₹{_pos_obj.stop_loss:,.2f}" if _pos_obj.stop_loss else "—"
-                    _tgt_s  = f"₹{_pos_obj.target:,.2f}"   if _pos_obj.target    else "—"
+                    # Show dynamic exit state instead of static target
+                    if getattr(_pos_obj, "tsl_active", False) and _pos_obj.trailing_stop:
+                        _tgt_s = f"TSL ₹{_pos_obj.trailing_stop:,.2f}"
+                    elif getattr(_pos_obj, "breakeven_set", False):
+                        _tgt_s = f"BE ₹{_pos_obj.entry_price:,.2f}"
+                    elif getattr(_pos_obj, "gap_state", "none") == "watching":
+                        _tgt_s = "⏳ Gap Watch"
+                    else:
+                        _tgt_s = "SL only"
                 else:
-                    _exit_p = _o.get("exit_price")
-                    _pnl_v  = _o.get("pnl")
-                    _curr_s = f"₹{_exit_p:,.2f}" if _exit_p is not None else "—"
-                    _sl_s   = "—"
-                    _tgt_s  = "—"
+                    _exit_p    = _o.get("exit_price")
+                    _pnl_v     = _o.get("pnl")
+                    _curr_s    = f"₹{_exit_p:,.2f}" if _exit_p is not None else "—"
+                    _sl_s      = "—"
+                    _exit_rsn  = _o.get("exit_reason", "")
+                    _tgt_s     = _exit_rsn if _exit_rsn else "—"
 
                 _pnl_col = "#145c2e" if (_pnl_v is not None and _pnl_v >= 0) else "#8b1a1a"
                 _pnl_md  = (
@@ -1366,6 +1579,17 @@ if _page == "trading":
                     "CANCELLED": ("#7a4800", "#fff3d4"),
                     "REJECTED":  ("#8b1a1a", "#fde8e8"),
                 }.get(_status, ("#1e2a3a", "#f0f4fa"))
+                # Colour-code EXECUTED rows by exit reason
+                if _status == "EXECUTED":
+                    _er = _o.get("exit_reason", "")
+                    if _er in ("Stop Loss", "Gap Down Exit"):
+                        _fg_st, _bg_st = "#8b1a1a", "#fde8e8"   # red — loss protection
+                    elif _er == "Trailing Stop":
+                        _fg_st, _bg_st = "#145c2e", "#d4f0e0"   # green — TSL profit
+                    elif _er == "EMA Exit":
+                        _fg_st, _bg_st = "#4a1a7a", "#ecdcf8"   # purple — EMA filter
+                    elif _er == "Strategy Signal":
+                        _fg_st, _bg_st = "#1a4f8a", "#dce8f8"   # blue — signal exit
                 _status_md = (
                     f"<span style='color:{_fg_st};background:{_bg_st};"
                     f"font-weight:700;padding:2px 7px;border-radius:4px;"
@@ -1459,8 +1683,21 @@ elif _page == "overview":
             if r and "portfolio" in r
         ) / max(len([r for r in _ov_results.values() if r and "portfolio" in r]), 1)
         col2.metric("Current Equity", f"₹{avg_equity:,.0f}")
-        col3.metric("Total P&L", f"₹{total_pnl:+,.0f}",
-                    delta=f"{total_pnl / config.CAPITAL * 100:+.2f}%")
+        _ov_fg = "#145c2e" if total_pnl >= 0 else "#8b1a1a"
+        _ov_bg = "#e6f9ee" if total_pnl >= 0 else "#fde8e8"
+        _ov_bd = "#a3d9b7" if total_pnl >= 0 else "#f4a0a0"
+        col3.markdown(
+            f'<div style="background:{_ov_bg};border:1px solid {_ov_bd};'
+            f'border-radius:12px;padding:16px 20px;'
+            f'box-shadow:0 2px 8px rgba(26,79,138,0.08)">'
+            f'<div style="color:#4a6080;font-size:0.78rem;font-weight:600">Total P&amp;L</div>'
+            f'<div style="color:{_ov_fg};font-weight:700;font-size:1.5rem;margin:4px 0">'
+            f'&#8377;{total_pnl:+,.0f}</div>'
+            f'<div style="color:#6a8090;font-size:0.75rem">'
+            f'{total_pnl / config.CAPITAL * 100:+.2f}% of starting capital</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
         col4.metric("Paper Ticks", _ov_ticks)
     else:
         col2.metric("Current Equity", f"₹{config.CAPITAL:,.0f}")
@@ -1844,18 +2081,77 @@ elif _page == "settings":
         st.error(f"Capital error: {_e}")
 
     try:
-        with st.expander("📉 Risk Management", expanded=True):
+        with st.expander("📉 Risk Management — Dynamic Exit Strategy", expanded=True):
+            st.caption(
+                "Initial SL sets the worst-case loss at entry. "
+                "Break-even moves SL to entry once in profit. "
+                "TSL then trails the highest high to lock in gains."
+            )
             col1, col2 = st.columns(2)
-            _sl  = col1.slider("Stop Loss %",        0.5, 5.0,  max(0.5, min(5.0,  round(_cfg("STOP_LOSS_PCT")     * 100, 1))), step=0.1, key=f"cfg_sl_{_k}")
-            _tp  = col2.slider("Take Profit %",      1.0, 10.0, max(1.0, min(10.0, round(_cfg("TARGET_PCT")         * 100, 1))), step=0.5, key=f"cfg_tp_{_k}")
-            _ts  = col1.slider("Trailing Stop %",    0.5, 3.0,  max(0.5, min(3.0,  round(_cfg("TRAILING_STOP_PCT") * 100, 1))), step=0.1, key=f"cfg_ts_{_k}")
-            _mop = col2.slider("Max Open Positions", 1,   10,   max(1,   min(10,   _cfg("MAX_OPEN_POSITIONS"))),                             key=f"cfg_mop_{_k}")
-            _mps = col1.slider("Max Position Size %",5,   50,   max(5,   min(50,   int(_cfg("MAX_POSITION_PCT") * 100))),         step=5,   key=f"cfg_mps_{_k}")
-            _set("STOP_LOSS_PCT",     _sl  / 100)
-            _set("TARGET_PCT",        _tp  / 100)
-            _set("TRAILING_STOP_PCT", _ts  / 100)
-            _set("MAX_OPEN_POSITIONS",_mop)
-            _set("MAX_POSITION_PCT",  _mps / 100)
+            _sl  = col1.slider(
+                "Initial Stop Loss %", 0.5, 5.0,
+                max(0.5, min(5.0, round(_cfg("STOP_LOSS_PCT") * 100, 1))),
+                step=0.1, key=f"cfg_sl_{_k}",
+                help="Initial hard stop-loss from entry price",
+            )
+            _be  = col2.slider(
+                "Break-Even Trigger %", 0.5, 3.0,
+                max(0.5, min(3.0, round(_cfg("BREAKEVEN_TRIGGER_PCT") * 100, 1))),
+                step=0.1, key=f"cfg_be_{_k}",
+                help="Move SL to entry (break-even) once profit reaches this %",
+            )
+            _tsla = col1.slider(
+                "TSL Activation %", 1.0, 5.0,
+                max(1.0, min(5.0, round(_cfg("TSL_ACTIVATION_PCT") * 100, 1))),
+                step=0.1, key=f"cfg_tsla_{_k}",
+                help="Activate trailing stop once profit exceeds this %",
+            )
+            _ts  = col2.slider(
+                "Trailing Stop Distance %", 0.5, 3.0,
+                max(0.5, min(3.0, round(_cfg("TRAILING_STOP_PCT") * 100, 1))),
+                step=0.1, key=f"cfg_ts_{_k}",
+                help="TSL trails the highest high at this % distance",
+            )
+            _ema_p = col1.slider(
+                "EMA Period (exit filter)", 5, 50,
+                max(5, min(50, int(_cfg("EMA_PERIOD")))),
+                step=1, key=f"cfg_ema_{_k}",
+                help="Exit position if price closes below this EMA on 15-min chart",
+            )
+            _mop = col2.slider(
+                "Max Open Positions", 1, 10,
+                max(1, min(10, _cfg("MAX_OPEN_POSITIONS"))),
+                key=f"cfg_mop_{_k}",
+            )
+            _mps = col1.slider(
+                "Max Position Size %", 5, 50,
+                max(5, min(50, int(_cfg("MAX_POSITION_PCT") * 100))),
+                step=5, key=f"cfg_mps_{_k}",
+            )
+            col3, col4 = st.columns(2)
+            _minval = col3.number_input(
+                "Min Position Value ₹",
+                min_value=1_000, max_value=50_000,
+                value=max(1_000, int(_cfg("MIN_POSITION_VALUE"))),
+                step=500, key=f"cfg_minval_{_k}",
+                help="Don't enter a position unless at least this much is deployed",
+            )
+            _minpnl = col4.number_input(
+                "Min P&L to Book ₹",
+                min_value=0, max_value=2_000,
+                value=max(0, int(_cfg("MIN_PNL_TO_BOOK"))),
+                step=50, key=f"cfg_minpnl_{_k}",
+                help="Skip signal/EMA exits if |P&L| is below this amount (avoids tiny trades)",
+            )
+            _set("STOP_LOSS_PCT",         _sl   / 100)
+            _set("BREAKEVEN_TRIGGER_PCT", _be   / 100)
+            _set("TSL_ACTIVATION_PCT",    _tsla / 100)
+            _set("TRAILING_STOP_PCT",     _ts   / 100)
+            _set("EMA_PERIOD",            _ema_p)
+            _set("MAX_OPEN_POSITIONS",    _mop)
+            _set("MAX_POSITION_PCT",      _mps  / 100)
+            _set("MIN_POSITION_VALUE",    float(_minval))
+            _set("MIN_PNL_TO_BOOK",       float(_minpnl))
     except Exception as _e:
         st.error(f"Risk Management error: {_e}")
 

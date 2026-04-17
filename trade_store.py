@@ -120,6 +120,57 @@ def get_last_save_time(strategy_name: str, mode: str = "sim") -> Optional[dateti
     return datetime.fromtimestamp(path.stat().st_mtime)
 
 
+# ─────────────────────────────────────────────────────────
+# Last-known price cache (one file per mode)
+# ─────────────────────────────────────────────────────────
+
+def _prices_path(mode: str) -> Path:
+    return _mode_dir(mode) / "prices.json"
+
+
+def save_last_prices(prices: dict, mode: str = "sim") -> bool:
+    """
+    Persist the latest live prices fetched by yfinance so they survive
+    an app restart and can be shown before the first new tick completes.
+
+    prices: {symbol_ns: float}  e.g. {"RELIANCE.NS": 2910.5, ...}
+    Returns True on success.
+    """
+    if not prices:
+        return False
+    path = _prices_path(mode)
+    try:
+        with open(path, "w") as fh:
+            json.dump(
+                {"prices": prices, "_saved_at": datetime.now().isoformat()},
+                fh,
+                indent=2,
+            )
+        return True
+    except Exception as exc:
+        logger.error(f"trade_store: save_last_prices failed [{mode}]: {exc}")
+        return False
+
+
+def load_last_prices(mode: str = "sim") -> dict:
+    """
+    Return the last prices saved by save_last_prices().
+    Returns an empty dict if the file doesn't exist or is unreadable.
+    """
+    path = _prices_path(mode)
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        prices = data.get("prices", {})
+        # Values must be numeric — drop anything else (corrupted entries)
+        return {k: float(v) for k, v in prices.items() if isinstance(v, (int, float))}
+    except Exception as exc:
+        logger.error(f"trade_store: load_last_prices failed [{mode}]: {exc}")
+        return {}
+
+
 def load_all_trade_history(mode: str = "sim") -> list:
     """
     Return a combined list of all closed trade dicts from every saved strategy

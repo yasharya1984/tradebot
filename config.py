@@ -10,9 +10,23 @@ Edit this file to configure your bot before running.
 CAPITAL = 100_000            # Starting capital in INR
 MAX_POSITION_PCT = 0.20      # Max 20% of capital in any single stock
 MAX_OPEN_POSITIONS = 10       # Max concurrent open positions
-STOP_LOSS_PCT = 0.02         # 2% stop-loss per trade
-TARGET_PCT = 0.04            # 4% profit target per trade
-TRAILING_STOP_PCT = 0.015    # 1.5% trailing stop once in profit
+STOP_LOSS_PCT = 0.02         # 2% initial stop-loss per trade
+TARGET_PCT = 0.04            # Legacy — static target no longer used; TSL handles exits
+TRAILING_STOP_PCT = 0.015    # 1.5% trailing stop distance from Highest High
+
+# ─────────────────────────────────────────────
+# DYNAMIC EXIT STRATEGY (Equity Module)
+# ─────────────────────────────────────────────
+BREAKEVEN_TRIGGER_PCT = 0.015   # Move SL to entry once profit >= 1.5%
+TSL_ACTIVATION_PCT    = 0.02    # Activate trailing stop once profit >= 2%
+EMA_PERIOD            = 20      # EMA period for secondary exit filter
+EMA_TIMEFRAME         = "15m"   # Candle timeframe for EMA exit filter
+
+# ─────────────────────────────────────────────
+# POSITION SIZING GUARDS
+# ─────────────────────────────────────────────
+MIN_POSITION_VALUE = 5_000   # Minimum ₹5,000 invested per symbol
+MIN_PNL_TO_BOOK    = 200     # Minimum ₹200 P&L to execute a signal exit
 
 # ─────────────────────────────────────────────
 # ZERODHA KITE API CREDENTIALS

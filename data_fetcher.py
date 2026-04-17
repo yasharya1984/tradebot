@@ -17,6 +17,10 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+# Maximum symbols per single yf.download() call.
+# yfinance uses an internal thread pool; batches beyond ~100 become unreliable.
+_YF_BATCH_SIZE = 60
+
 
 class DataFetcher:
     """Unified data fetcher for NSE stocks."""
@@ -64,8 +68,14 @@ class DataFetcher:
             end = datetime.now()
             start = end - timedelta(days=period_days + 10)  # Extra buffer
 
+            _t0 = time.perf_counter()
             ticker = yf.Ticker(symbol)
             df = ticker.history(start=start, end=end, interval=interval)
+            _elapsed = time.perf_counter() - _t0
+            if _elapsed > 2.0:
+                msg = f"[DEBUG] yfinance fetch took: {_elapsed:.1f} seconds (single: {symbol})"
+                print(msg, flush=True)
+                logger.info(msg)
 
             if df.empty:
                 logger.warning(f"No data returned for {symbol}")
@@ -98,7 +108,8 @@ class DataFetcher:
         period_days: int = 365,
         interval: str = "1d",
     ) -> Dict[str, pd.DataFrame]:
-        """Fetch historical data for multiple symbols."""
+        """Fetch historical data for multiple symbols (sequential fallback).
+        Prefer get_multiple_historical_batch() for bulk requests."""
         results = {}
         for i, symbol in enumerate(symbols):
             df = self.get_historical(symbol, period_days, interval)
@@ -108,6 +119,218 @@ class DataFetcher:
             if i > 0 and i % 10 == 0:
                 time.sleep(1)
         return results
+
+    def get_multiple_historical_batch(
+        self,
+        symbols: List[str],
+        period_days: int = 60,
+        interval: str = "1d",
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Batch-fetch historical OHLCV for many symbols using yf.download().
+
+        yf.download() uses an internal ThreadPoolExecutor so a single call for
+        60 symbols is dramatically faster than 60 sequential Ticker.history()
+        calls.  Symbols are processed in chunks of _YF_BATCH_SIZE to stay within
+        reliable request limits.
+
+        Each batch prints:
+            [DEBUG] yfinance fetch took: X.X seconds (N symbols, Xd history)
+
+        Returns a dict {symbol: DataFrame} for symbols that returned data.
+        Falls back to individual get_historical() for any symbol that fails.
+        """
+        if not symbols:
+            return {}
+
+        required_cols = {"Open", "High", "Low", "Close", "Volume"}
+
+        # ── Serve fresh items from cache ───────────────────────────────
+        results: Dict[str, pd.DataFrame] = {}
+        stale: List[str] = []
+        for sym in symbols:
+            ck = f"{sym}_{period_days}_{interval}"
+            if ck in self._cache:
+                age = (datetime.now() - self._cache_time[ck]).seconds
+                if age < self.cache_duration:
+                    results[sym] = self._cache[ck]
+                    continue
+            stale.append(sym)
+
+        if not stale:
+            return results
+
+        # ── Process in batches ─────────────────────────────────────────
+        end_str   = datetime.now().strftime("%Y-%m-%d")
+        start_str = (datetime.now() - timedelta(days=period_days + 15)).strftime("%Y-%m-%d")
+
+        for batch_start in range(0, len(stale), _YF_BATCH_SIZE):
+            batch = stale[batch_start: batch_start + _YF_BATCH_SIZE]
+            t0 = time.perf_counter()
+            try:
+                raw = yf.download(
+                    batch,
+                    start=start_str,
+                    end=end_str,
+                    interval=interval,
+                    group_by="ticker",
+                    progress=False,
+                    threads=True,
+                    auto_adjust=True,
+                )
+                elapsed = time.perf_counter() - t0
+                msg = (
+                    f"[DEBUG] yfinance fetch took: {elapsed:.1f} seconds "
+                    f"({len(batch)} symbols, {period_days}d history)"
+                )
+                print(msg, flush=True)
+                logger.info(msg)
+
+                if raw.empty:
+                    raise ValueError("Empty result from yf.download")
+
+                # yf.download returns a flat DataFrame for a single ticker
+                if len(batch) == 1:
+                    sym = batch[0]
+                    df  = raw.copy()
+                    if required_cols.issubset(df.columns):
+                        df = df[list(required_cols)].dropna().tail(period_days)
+                        if not df.empty:
+                            results[sym] = df
+                            ck = f"{sym}_{period_days}_{interval}"
+                            self._cache[ck]      = df
+                            self._cache_time[ck] = datetime.now()
+                else:
+                    # MultiIndex columns: top level = symbol, second = OHLCV field
+                    top_level = raw.columns.get_level_values(0).unique()
+                    for sym in batch:
+                        try:
+                            if sym not in top_level:
+                                continue
+                            df = raw[sym].copy()
+                            if not required_cols.issubset(df.columns):
+                                continue
+                            df = df[list(required_cols)].dropna().tail(period_days)
+                            if df.empty:
+                                continue
+                            results[sym] = df
+                            ck = f"{sym}_{period_days}_{interval}"
+                            self._cache[ck]      = df
+                            self._cache_time[ck] = datetime.now()
+                        except Exception as _sym_exc:
+                            logger.debug(f"Batch parse failed for {sym}: {_sym_exc}")
+
+            except Exception as exc:
+                elapsed = time.perf_counter() - t0
+                msg = (
+                    f"[DEBUG] yfinance fetch took: {elapsed:.1f} seconds "
+                    f"(batch FAILED: {exc})"
+                )
+                print(msg, flush=True)
+                logger.warning(msg)
+                # Fall back to sequential for this batch
+                for sym in batch:
+                    df = self.get_historical(sym, period_days, interval)
+                    if not df.empty:
+                        results[sym] = df
+
+        return results
+
+    def get_multiple_prices_fast(self, symbols: List[str]) -> Dict[str, float]:
+        """
+        Batch-fetch the latest close price for many symbols using yf.download().
+
+        Uses a 2-day window so the most recent trading day's close is always
+        available.  The result is cached for cache_duration seconds.
+
+        Prints:
+            [DEBUG] yfinance fetch took: X.X seconds (N symbols, prices)
+
+        Falls back to individual get_current_price() calls on failure.
+        """
+        if not symbols:
+            return {}
+
+        # ── Serve from cache ───────────────────────────────────────────
+        prices: Dict[str, float] = {}
+        stale: List[str] = []
+        for sym in symbols:
+            ck = f"{sym}_price"
+            if ck in self._cache:
+                age = (datetime.now() - self._cache_time[ck]).seconds
+                if age < self.cache_duration:
+                    prices[sym] = float(self._cache[ck])
+                    continue
+            stale.append(sym)
+
+        if not stale:
+            return prices
+
+        # ── Batch download ─────────────────────────────────────────────
+        for batch_start in range(0, len(stale), _YF_BATCH_SIZE):
+            batch = stale[batch_start: batch_start + _YF_BATCH_SIZE]
+            t0 = time.perf_counter()
+            try:
+                raw = yf.download(
+                    batch,
+                    period="3d",
+                    interval="1d",
+                    group_by="ticker",
+                    progress=False,
+                    threads=True,
+                    auto_adjust=True,
+                )
+                elapsed = time.perf_counter() - t0
+                msg = (
+                    f"[DEBUG] yfinance fetch took: {elapsed:.1f} seconds "
+                    f"({len(batch)} symbols, prices)"
+                )
+                print(msg, flush=True)
+                logger.info(msg)
+
+                if raw.empty:
+                    raise ValueError("Empty result from yf.download")
+
+                if len(batch) == 1:
+                    sym = batch[0]
+                    if "Close" in raw.columns:
+                        val = raw["Close"].dropna()
+                        if not val.empty:
+                            prices[sym] = float(val.iloc[-1])
+                            ck = f"{sym}_price"
+                            self._cache[ck]      = prices[sym]
+                            self._cache_time[ck] = datetime.now()
+                else:
+                    top_level = raw.columns.get_level_values(0).unique()
+                    for sym in batch:
+                        try:
+                            if sym not in top_level:
+                                continue
+                            col = raw[sym]["Close"].dropna()
+                            if col.empty:
+                                continue
+                            prices[sym] = float(col.iloc[-1])
+                            ck = f"{sym}_price"
+                            self._cache[ck]      = prices[sym]
+                            self._cache_time[ck] = datetime.now()
+                        except Exception as _sym_exc:
+                            logger.debug(f"Batch price parse failed for {sym}: {_sym_exc}")
+
+            except Exception as exc:
+                elapsed = time.perf_counter() - t0
+                msg = (
+                    f"[DEBUG] yfinance fetch took: {elapsed:.1f} seconds "
+                    f"(batch FAILED: {exc})"
+                )
+                print(msg, flush=True)
+                logger.warning(msg)
+                # Fall back to individual calls
+                for sym in batch:
+                    p = self.get_current_price(sym)
+                    if p is not None:
+                        prices[sym] = p
+
+        return prices
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Get current/last traded price for a symbol."""

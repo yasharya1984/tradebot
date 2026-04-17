@@ -6,6 +6,7 @@ Works in both simulation and live mode.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -14,7 +15,9 @@ import pandas as pd
 
 from config import (
     CAPITAL, MAX_POSITION_PCT, MAX_OPEN_POSITIONS,
-    STOP_LOSS_PCT, TARGET_PCT, TRAILING_STOP_PCT,
+    STOP_LOSS_PCT, TRAILING_STOP_PCT,
+    BREAKEVEN_TRIGGER_PCT, TSL_ACTIVATION_PCT,
+    MIN_POSITION_VALUE, MIN_PNL_TO_BOOK,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,9 +32,17 @@ class Position:
     entry_date:     datetime
     strategy:       str
     stop_loss:      float
-    target:         float
+    target:         Optional[float] = None   # Legacy; TSL handles profit exits
     trailing_stop:  Optional[float] = None
-    highest_price:  Optional[float] = None  # For trailing stop tracking
+    highest_price:  Optional[float] = None   # Tracks highest high since entry
+
+    # Dynamic exit state
+    breakeven_set:  bool = False   # Has SL been moved to entry (break-even)?
+    tsl_active:     bool = False   # Is the trailing stop currently active?
+
+    # Gap handling state
+    gap_state:      str = "none"         # "none" | "watching" | "recovered"
+    gap_down_open:  Optional[float] = None  # Open price when gap-down detected
 
     @property
     def invested_value(self) -> float:
@@ -44,26 +55,40 @@ class Position:
         return (current_price / self.entry_price - 1) * 100
 
     def should_stop_loss(self, current_price: float) -> bool:
+        """Check if current SL (initial or break-even) is hit."""
         return current_price <= self.stop_loss
 
     def should_take_profit(self, current_price: float) -> bool:
-        return current_price >= self.target
+        """Static target — kept for legacy; no longer set on new positions."""
+        return self.target is not None and current_price >= self.target
 
     def update_trailing_stop(self, current_price: float) -> bool:
         """
-        Update trailing stop if price moved higher.
-        Returns True if trailing stop was triggered.
+        Dynamic trailing stop with two phases:
+          Phase 1 (+1.5% profit): move SL to entry price (break-even).
+          Phase 2 (+2.0% profit): activate TSL at highest_high × (1 - 1.5%).
+        Returns True only when the TSL itself is triggered (not the SL).
         """
-        if self.highest_price is None:
-            self.highest_price = current_price
+        profit_pct = (current_price / self.entry_price - 1)
 
-        if current_price > self.highest_price:
-            self.highest_price = current_price
-            # Move stop up
-            self.trailing_stop = self.highest_price * (1 - TRAILING_STOP_PCT)
+        # Phase 1 — break-even trigger
+        if profit_pct >= BREAKEVEN_TRIGGER_PCT and not self.breakeven_set:
+            self.stop_loss = self.entry_price
+            self.breakeven_set = True
 
-        if self.trailing_stop and current_price <= self.trailing_stop:
-            return True  # Trailing stop hit
+        # Phase 2 — trailing stop activation
+        if profit_pct >= TSL_ACTIVATION_PCT:
+            self.tsl_active = True
+            if self.highest_price is None or current_price > self.highest_price:
+                self.highest_price = current_price
+            new_tsl = self.highest_price * (1 - TRAILING_STOP_PCT)
+            if self.trailing_stop is None or new_tsl > self.trailing_stop:
+                self.trailing_stop = new_tsl
+
+        # TSL trigger check (only when TSL is active)
+        if self.tsl_active and self.trailing_stop is not None and current_price <= self.trailing_stop:
+            return True
+
         return False
 
     def to_dict(self) -> dict:
@@ -77,20 +102,28 @@ class Position:
             "target":        self.target,
             "trailing_stop": self.trailing_stop,
             "highest_price": self.highest_price,
+            "breakeven_set": self.breakeven_set,
+            "tsl_active":    self.tsl_active,
+            "gap_state":     self.gap_state,
+            "gap_down_open": self.gap_down_open,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Position":
         return cls(
-            symbol        = d["symbol"],
-            entry_price   = d["entry_price"],
-            quantity      = d["quantity"],
-            entry_date    = datetime.fromisoformat(d["entry_date"]),
-            strategy      = d["strategy"],
-            stop_loss     = d["stop_loss"],
-            target        = d["target"],
-            trailing_stop = d.get("trailing_stop"),
-            highest_price = d.get("highest_price"),
+            symbol         = d["symbol"],
+            entry_price    = d["entry_price"],
+            quantity       = d["quantity"],
+            entry_date     = datetime.fromisoformat(d["entry_date"]),
+            strategy       = d["strategy"],
+            stop_loss      = d["stop_loss"],
+            target         = d.get("target"),
+            trailing_stop  = d.get("trailing_stop"),
+            highest_price  = d.get("highest_price"),
+            breakeven_set  = d.get("breakeven_set", False),
+            tsl_active     = d.get("tsl_active", False),
+            gap_state      = d.get("gap_state", "none"),
+            gap_down_open  = d.get("gap_down_open"),
         )
 
 
@@ -164,26 +197,37 @@ class Portfolio:
         if len(self.positions) >= MAX_OPEN_POSITIONS:
             logger.debug(f"Max positions ({MAX_OPEN_POSITIONS}) reached")
             return False
-        # Must be able to afford at least 1 share with available cash
-        if entry_price > self.cash * 0.95:
-            logger.debug(f"Insufficient cash for {symbol}: price ₹{entry_price:,.0f}, cash ₹{self.cash:,.0f}")
+        # Must be able to afford at least MIN_POSITION_VALUE worth of shares
+        min_qty = math.ceil(MIN_POSITION_VALUE / entry_price)
+        min_cost = min_qty * entry_price
+        if min_cost > self.cash * 0.95:
+            logger.debug(
+                f"Insufficient cash for {symbol}: need ₹{min_cost:,.0f} "
+                f"(min position), have ₹{self.cash:,.0f}"
+            )
             return False
         return True
 
     def calculate_quantity(self, entry_price: float) -> int:
         """
-        Calculate how many shares to buy based on position sizing.
-        Always buys at least 1 share if the stock is affordable,
-        even if price exceeds the normal per-position budget.
+        Calculate shares to buy based on position sizing.
+        Enforces a minimum position value of MIN_POSITION_VALUE (₹5,000).
         """
         budget = min(
             self.initial_capital * MAX_POSITION_PCT,
             self.cash * 0.95,
         )
         quantity = int(budget / entry_price)
-        # High-priced stocks (e.g. ₹22,000+): buy at least 1 share
-        if quantity == 0 and entry_price <= self.cash * 0.95:
-            quantity = 1
+
+        # Ensure minimum position value
+        min_qty = math.ceil(MIN_POSITION_VALUE / entry_price)
+        if quantity < min_qty:
+            # Upgrade to minimum if we can afford it
+            if min_qty * entry_price <= self.cash * 0.95:
+                quantity = min_qty
+            else:
+                quantity = int(self.cash * 0.95 / entry_price)
+
         return quantity
 
     def open_position(
@@ -208,17 +252,16 @@ class Portfolio:
             cost = entry_price * quantity
 
         stop_loss = entry_price * (1 - STOP_LOSS_PCT)
-        target    = entry_price * (1 + TARGET_PCT)
 
         pos = Position(
-            symbol       = symbol,
-            entry_price  = entry_price,
-            quantity     = quantity,
-            entry_date   = entry_date or datetime.now(),
-            strategy     = strategy,
-            stop_loss    = stop_loss,
-            target       = target,
-            highest_price= entry_price,
+            symbol        = symbol,
+            entry_price   = entry_price,
+            quantity      = quantity,
+            entry_date    = entry_date or datetime.now(),
+            strategy      = strategy,
+            stop_loss     = stop_loss,
+            target        = None,        # No static target — TSL handles profit exits
+            highest_price = entry_price,
         )
 
         self.cash -= cost
@@ -226,7 +269,7 @@ class Portfolio:
 
         logger.info(
             f"OPENED {symbol}: {quantity} shares @ ₹{entry_price:.2f} | "
-            f"SL=₹{stop_loss:.2f} | TP=₹{target:.2f} | "
+            f"Initial SL=₹{stop_loss:.2f} | TSL activates at +2% | "
             f"Cash remaining=₹{self.cash:,.0f}"
         )
         return pos
@@ -238,9 +281,28 @@ class Portfolio:
         reason: str = "Signal",
         exit_date: Optional[datetime] = None,
     ) -> Optional[Trade]:
-        """Close an existing position."""
+        """
+        Close an existing position.
+
+        Min P&L guard: for non-risk-management exits (Strategy Signal, EMA Exit),
+        skip the close if |P&L| < MIN_PNL_TO_BOOK to avoid tiny transactions.
+        Risk management exits (Stop Loss, Trailing Stop, Gap Down Exit, etc.)
+        always execute regardless of P&L size.
+        """
         if symbol not in self.positions:
             logger.warning(f"No position found for {symbol}")
+            return None
+
+        pos = self.positions[symbol]
+        pnl_preview = (exit_price - pos.entry_price) * pos.quantity
+
+        # Apply minimum P&L threshold only to discretionary exits
+        _RISK_REASONS = {"Stop Loss", "Trailing Stop", "Gap Down Exit", "Manual Cancel", "End of Backtest"}
+        if reason not in _RISK_REASONS and abs(pnl_preview) < MIN_PNL_TO_BOOK:
+            logger.debug(
+                f"Skipping {reason} exit for {symbol}: "
+                f"P&L ₹{pnl_preview:.0f} below ₹{MIN_PNL_TO_BOOK} threshold"
+            )
             return None
 
         pos = self.positions.pop(symbol)

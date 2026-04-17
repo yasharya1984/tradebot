@@ -107,6 +107,9 @@ class StockSelector:
         Scan all 300 NSE stocks and return the top TOP_N_STOCKS by momentum,
         guaranteeing at least TOP_N_PER_CAP from each cap tier.
 
+        Uses get_multiple_historical_batch() (yf.download multi-threaded) instead
+        of a sequential symbol-by-symbol loop — roughly 5-10× faster.
+
         Args:
             period_days:     Historical data window
             max_volatility:  Exclude stocks with annualised vol above this %
@@ -120,6 +123,11 @@ class StockSelector:
             f"{len(SMALL_CAP_SYMBOLS)} small cap)..."
         )
 
+        # Single batch call replaces ~300 sequential yf.Ticker().history() calls
+        all_data = self.fetcher.get_multiple_historical_batch(
+            ALL_SYMBOLS, period_days=period_days + 10
+        )
+
         by_cap: Dict[str, List[Dict]] = {
             "Large Cap": [], "Mid Cap": [], "Small Cap": []
         }
@@ -127,8 +135,8 @@ class StockSelector:
 
         for symbol in ALL_SYMBOLS:
             try:
-                df = self.fetcher.get_historical(symbol, period_days=period_days + 10)
-                if df.empty or len(df) < MOMENTUM_LOOKBACK + 10:
+                df = all_data.get(symbol)
+                if df is None or df.empty or len(df) < MOMENTUM_LOOKBACK + 10:
                     failed.append(symbol)
                     continue
 

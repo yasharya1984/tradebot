@@ -7,15 +7,17 @@ An automated NSE (National Stock Exchange) day-trading bot with a Streamlit dash
 ## Features
 
 - **Dual-Mode Trading** — Run Simulation and Live modes simultaneously. Switch views with a toggle in the sidebar; each mode has fully independent settings, capital, and trade history.
-- **Paper Trading** — Simulate trades with virtual capital. All strategies run in parallel; positions and P&L tracked in real time.
+- **Paper Trading** — Simulate trades with virtual capital. All strategies run in parallel; positions and P&L tracked in real time. **Auto-starts on page load** if saved positions exist from a previous session.
 - **Live Trading** — Place real orders via Zerodha Kite Connect with a configurable capital cap.
 - **3 Trading Strategies** running in parallel:
   - `Moving Average Crossover` — Short/long MA crossover signals
   - `RSI + MACD` — Oversold/overbought RSI combined with MACD trend confirmation
   - `Momentum` — Price + volume momentum ranking
+- **Dynamic Exit Strategy** — Replaces static targets with a multi-phase trailing system (see below).
+- **Gap-Down Protection** — Timed exit logic that gives stocks a chance to recover before closing a position at the open.
+- **Position Sizing Guards** — Minimum ₹5,000 per position; minimum ₹200 P&L before booking a discretionary exit.
 - **Stock Screener** — Ranks stocks across a 300-symbol NSE universe (100 Large, 100 Mid, 100 Small cap) by momentum score.
 - **Backtester** — Runs any strategy over historical data and compares performance across strategies.
-- **Risk Management** — Stop-loss, profit target, and trailing stop per trade; max position size and max open positions globally.
 - **Streamlit Dashboard** — Live metrics, bot order log, portfolio status, screener results, backtest runner, and settings — all in one place.
 
 ---
@@ -41,6 +43,8 @@ python main.py dashboard
 # Opens at http://localhost:8501
 ```
 
+The bot **auto-starts** immediately if saved portfolios are found from a previous session. All open positions continue to be managed without pressing ▶️ Start.
+
 ---
 
 ## Running from the Command Line
@@ -64,20 +68,75 @@ The sidebar is always visible (fixed, no collapse). The top of the sidebar has a
 
 | Page | Description |
 |---|---|
-| **Trading** | Start/stop the bot; live order table; portfolio status with per-strategy breakdown |
+| **Trading** | Start/stop the bot; live order table with exit-state indicators; portfolio status with per-strategy breakdown |
 | **Overview** | Equity curve, cumulative P&L, win rate summary across strategies |
-| **History** | Filterable trade history with export |
+| **History** | Filterable trade history with export; exit reasons colour-coded by type |
 | **Screener** | Live momentum ranking of NSE 300 stocks with buy/sell signals |
 | **Backtest** | Run strategies over a custom date range; compare total return, Sharpe, drawdown |
-| **Settings** | Adjust all risk and strategy parameters (independent per mode) |
+| **Settings** | Adjust all risk, dynamic exit, and strategy parameters (independent per mode) |
+
+### Auto-start behaviour
+
+When the dashboard loads, it checks for saved portfolio files. If found, the bot resumes automatically — existing open positions continue to be evaluated for exits on every tick. No manual ▶️ Start required after a restart.
+
+### Exit State column (Trading page)
+
+The **Exit State** column in the Bot Orders table shows real-time progress of the dynamic exit strategy for each open position:
+
+| Value | Meaning |
+|---|---|
+| `SL only` | In initial phase — only the 2% hard stop is active |
+| `BE ₹{price}` | Break-even triggered — SL has moved to entry price |
+| `TSL ₹{price}` | Trailing stop is active at the shown level |
+| `⏳ Gap Watch` | Opening gap detected — waiting for 9:30 AM candle close |
+
+Executed orders are colour-coded by exit reason:
+- 🟢 Green — `Trailing Stop` (profitable TSL exit)
+- 🔴 Red — `Stop Loss` or `Gap Down Exit` (capital protection)
+- 🟣 Purple — `EMA Exit` (trend-based filter)
+- 🔵 Blue — `Strategy Signal`
+
+### Connectivity Alert
+
+A non-intrusive connectivity watchdog runs in the browser at all times. If the internet connection is lost it displays a fixed banner in the **bottom-right corner** of the screen:
+
+> ⚠️ **Connectivity Issue** — Check your internet connection
+
+The banner disappears automatically as soon as the connection is restored. The check uses two mechanisms:
+1. **`navigator.onLine`** — fires instantly on `offline`/`online` browser events.
+2. **Fetch probe** — every 10 seconds, sends a `HEAD` request to `google.com/generate_204` with a 4-second timeout to catch cases where the browser reports online but packets are not routing (e.g. VPN drop, captive portal).
+
+No action is needed to enable this — it starts automatically when the dashboard loads.
 
 ### URL-based navigation
 
-Each page and mode is reflected in the browser URL (e.g. `?page=settings&mode=live`). Refreshing the browser returns you to the same page and mode. You can also open two browser tabs — one with `?mode=sim` and one with `?mode=live` — to monitor both modes side by side.
+Each page and mode is reflected in the browser URL (e.g. `?page=settings&mode=live`). Refreshing the browser returns you to the same page and mode.
 
-### Live clock
+---
 
-The sidebar and hero banner both show a live NSE market status (OPEN / PRE-OPEN / CLOSED), countdown to open/close, and current IST time with seconds — all updating every second client-side.
+## Dynamic Exit Strategy (Equity Module)
+
+Replaces the old static 4% target with a multi-phase trailing system:
+
+### Phase 1 — Break-Even (at +1.5% profit)
+Once the trade reaches 1.5% profit, the Stop Loss is automatically moved to the entry price. This locks in a zero-loss floor.
+
+### Phase 2 — Trailing Stop (at +2% profit)
+Once profit exceeds 2%, a Trailing Stop (TSL) activates. It follows the **Highest High** reached since entry at a **1.5% distance**, and only ever moves up — never down.
+
+### EMA Filter
+At any time, if the price closes below the **20-period EMA on the 15-minute chart**, the position is exited immediately (subject to the ₹200 minimum P&L guard for small trades).
+
+### Gap-Down Timed Exit
+If a stock opens below the Stop Loss:
+1. **Do not exit at 9:15 AM.** Start watching.
+2. Wait for the first **15-minute candle** to close (by 9:30 AM).
+3. If the candle is **green** (recovery): hold the position and set a new SL at the opening candle's Low.
+4. If the candle is **red** or the price is still below SL after 9:30 AM: exit immediately.
+
+### Position Sizing Guards
+- **Minimum ₹5,000 per symbol** — the bot will not buy a position worth less than ₹5,000.
+- **Minimum ₹200 P&L to book** — discretionary exits (Strategy Signal, EMA Filter) are skipped if the absolute P&L is below ₹200, avoiding noise transactions. Risk-management exits (Stop Loss, Trailing Stop, Gap Down) always execute regardless.
 
 ---
 
@@ -104,10 +163,20 @@ Both modes run independently in parallel. Switching the toggle only changes whic
 | `CAPITAL` | ₹1,00,000 | Starting virtual capital |
 | `MAX_POSITION_PCT` | 20% | Max capital in any single stock |
 | `MAX_OPEN_POSITIONS` | 10 | Max concurrent open positions |
-| `STOP_LOSS_PCT` | 2% | Stop-loss per trade |
-| `TARGET_PCT` | 4% | Profit target per trade |
-| `TRAILING_STOP_PCT` | 1.5% | Trailing stop once in profit |
 | `LIVE_TRADING_CAP` | ₹50,000 | Max real money deployed in live mode |
+
+### Dynamic Exit Strategy
+
+| Setting | Default | Description |
+|---|---|---|
+| `STOP_LOSS_PCT` | 2% | Initial hard stop-loss from entry |
+| `BREAKEVEN_TRIGGER_PCT` | 1.5% | Move SL to entry once profit ≥ this |
+| `TSL_ACTIVATION_PCT` | 2% | Activate trailing stop once profit ≥ this |
+| `TRAILING_STOP_PCT` | 1.5% | TSL distance from the Highest High |
+| `EMA_PERIOD` | 20 | EMA period for secondary exit filter |
+| `EMA_TIMEFRAME` | 15m | Candle timeframe for EMA calculation |
+| `MIN_POSITION_VALUE` | ₹5,000 | Minimum position size per symbol |
+| `MIN_PNL_TO_BOOK` | ₹200 | Min P&L for discretionary (signal/EMA) exits |
 
 ### Strategy Parameters
 
@@ -152,11 +221,11 @@ trading_bot/
 ├── dashboard.py          # Streamlit dashboard (main UI)
 ├── main.py               # CLI entry point
 ├── config.py             # All configuration settings
-├── simulator.py          # Paper trading engine
+├── simulator.py          # Paper trading + backtest engine
 ├── zerodha_trader.py     # Zerodha Kite Connect wrapper
 ├── bot_orders.py         # Order log (read/write orders.json)
-├── portfolio.py          # Portfolio state & P&L calculations
-├── data_fetcher.py       # Yahoo Finance data fetcher
+├── portfolio.py          # Portfolio state, dynamic exit logic
+├── data_fetcher.py       # Yahoo Finance / Kite data fetcher
 ├── stock_selector.py     # Momentum-based stock screener
 ├── trade_store.py        # Persistent trade history
 ├── strategies/
