@@ -1,0 +1,16 @@
+# Core dependencies
+yfinance>=0.2.36
+pandas>=2.0.0
+numpy>=1.26.0
+streamlit>=1.35.0
+plotly>=5.20.0
+
+# Technical analysis
+ta>=0.11.0
+
+# Zerodha Kite (only needed for live trading)
+# kiteconnect>=5.0.1
+
+# Utilities
+python-dateutil>=2.9.0
+requests>=2.31.0
