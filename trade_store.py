@@ -90,9 +90,10 @@ def delete_all_portfolios(mode: str = "sim") -> int:
     """Delete every saved portfolio for the given mode.  Returns count deleted."""
     d = _mode_dir(mode)
     count = 0
+    _RESERVED = {"orders.json", "prices.json"}
     for f in d.glob("*.json"):
-        if f.name == "orders.json":
-            continue   # handled separately by bot_orders
+        if f.name in _RESERVED:
+            continue   # orders handled by bot_orders; prices handled by save/load_last_prices
         try:
             f.unlink()
             count += 1
@@ -106,8 +107,9 @@ def list_saved_strategies(mode: str = "sim") -> list:
     """Return list of strategy names that have a saved file on disk."""
     d = _mode_dir(mode)
     names = []
+    _RESERVED = {"orders.json", "prices.json"}
     for f in sorted(d.glob("*.json")):
-        if f.name != "orders.json":
+        if f.name not in _RESERVED:
             names.append(f.stem)
     return names
 

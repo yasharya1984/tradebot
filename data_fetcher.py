@@ -12,6 +12,9 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import concurrent.futures
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import yfinance as yf
 
@@ -332,6 +335,119 @@ class DataFetcher:
 
         return prices
 
+    def get_current_price_batch(self, symbols: List[str]) -> Dict[str, Optional[float]]:
+        """
+        Batch-fetch the LTP (Last Traded Price) for many symbols concurrently.
+
+        Uses fast_info.last_price — the actual intraday LTP — instead of the
+        daily-close bar returned by yf.download().  This fixes the bug where
+        get_multiple_prices_fast() showed yesterday's closing price even after
+        today's market had opened.
+
+        Staleness guard: if the NSE market has opened today but the only price
+        available is from a previous trading day, the symbol is treated as an
+        error (returns None) so the UI can display ❌ instead of stale data.
+
+        Returns:
+            {symbol: float}   – verified LTP
+            {symbol: None}    – price unavailable / stale (show ❌, skip trading)
+
+        Prints:
+            [DEBUG] yfinance LTP batch: X.Xs (N symbols, N OK, N errors)
+            [DEBUG] yfinance LTP slow: X.Xs (<symbol>)   – for slow individual fetches
+        """
+        if not symbols:
+            return {}
+
+        if self.kite:
+            return {s: self._get_kite_price(s) for s in symbols}
+
+        market_opened_today = self._market_opened_today()
+        today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+        # ── Serve from cache ───────────────────────────────────────────
+        prices: Dict[str, Optional[float]] = {}
+        stale: List[str] = []
+        for sym in symbols:
+            ck = f"{sym}_ltp"
+            if ck in self._cache:
+                age = (datetime.now() - self._cache_time[ck]).seconds
+                if age < self.cache_duration:
+                    prices[sym] = self._cache[ck]   # may be None (cached error)
+                    continue
+            stale.append(sym)
+
+        if not stale:
+            return prices
+
+        results: Dict[str, Optional[float]] = {}
+        errors: List[str] = []
+
+        def _fetch_one(sym: str) -> None:
+            try:
+                ticker = yf.Ticker(sym)
+                _t = time.perf_counter()
+                info = ticker.fast_info
+                price = getattr(info, "last_price", None)
+                elapsed = time.perf_counter() - _t
+                if elapsed > 3.0:
+                    msg = f"[DEBUG] yfinance LTP slow: {elapsed:.1f}s ({sym})"
+                    print(msg, flush=True)
+                    logger.info(msg)
+
+                if price is not None and float(price) > 0:
+                    results[sym] = float(price)
+                    return
+
+                # fast_info gave nothing — fall back to recent history
+                df = ticker.history(period="5d", interval="1d")
+                if not df.empty and "Close" in df.columns:
+                    last_idx = df.index[-1]
+                    last_date = (
+                        last_idx.date() if hasattr(last_idx, "date") else last_idx
+                    )
+                    if market_opened_today and last_date < today_ist:
+                        # Only yesterday's bar available but market opened today → stale
+                        results[sym] = None
+                        errors.append(sym)
+                    else:
+                        results[sym] = float(df["Close"].iloc[-1])
+                else:
+                    results[sym] = None
+                    errors.append(sym)
+            except Exception as exc:
+                logger.error(f"LTP fetch failed for {sym}: {exc}")
+                results[sym] = None
+                errors.append(sym)
+
+        t0 = time.perf_counter()
+        max_workers = min(20, len(stale))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_fetch_one, stale))
+        elapsed = time.perf_counter() - t0
+
+        n_ok  = sum(1 for v in results.values() if v is not None)
+        n_err = len(errors)
+        msg = (
+            f"[DEBUG] yfinance LTP batch: {elapsed:.1f}s "
+            f"({len(stale)} symbols, {n_ok} OK, {n_err} errors)"
+        )
+        print(msg, flush=True)
+        logger.info(msg)
+        if errors:
+            err_msg = f"[DEBUG] LTP errors (❌): {errors}"
+            print(err_msg, flush=True)
+            logger.warning(err_msg)
+
+        # Cache and merge results
+        for sym, p in results.items():
+            ck = f"{sym}_ltp"
+            self._cache[ck]      = p
+            self._cache_time[ck] = datetime.now()
+            prices[sym] = p
+
+        return prices
+
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Get current/last traded price for a symbol."""
         # If Kite is connected, use it for real-time price
@@ -428,9 +544,18 @@ class DataFetcher:
             logger.error(f"Kite historical failed for {symbol}: {e}")
             return pd.DataFrame()
 
+    def _market_opened_today(self) -> bool:
+        """
+        True if the NSE market has already opened today (even if currently closed).
+        Weekday AND IST time ≥ 09:15.  Used for staleness checks.
+        """
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        if now.weekday() >= 5:
+            return False
+        return now.hour > 9 or (now.hour == 9 and now.minute >= 15)
+
     def is_market_open(self) -> bool:
         """Check if NSE market is currently open (9:15 AM – 3:30 PM IST, Mon–Fri)."""
-        from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("Asia/Kolkata"))
         if now.weekday() >= 5:  # Saturday/Sunday
             return False

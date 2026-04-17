@@ -386,8 +386,11 @@ class Simulator:
             symbols, period_days=60
         )
 
-        # ── Batch-fetch current prices for ALL selected stocks ─────────
-        live_prices = self.fetcher.get_multiple_prices_fast(symbols)
+        # ── Batch-fetch current LTP for ALL selected stocks ───────────
+        # get_current_price_batch() uses fast_info.last_price (real LTP) and
+        # returns None for any symbol whose price cannot be verified as today's
+        # data.  Never falls back to a stale daily-close bar.
+        live_prices = self.fetcher.get_current_price_batch(symbols)
 
         # ── Intraday (15-min) data — only for open positions ──────────
         # Limits the expensive intraday calls to at most MAX_OPEN_POSITIONS.
@@ -402,7 +405,18 @@ class Simulator:
             if df is None or df.empty:
                 continue
 
-            current_price = live_prices.get(symbol) or float(df["Close"].iloc[-1])
+            current_price = live_prices.get(symbol)
+            if current_price is None:
+                # Price could not be verified as today's LTP — skip all trading
+                # decisions for this symbol to avoid acting on stale data.
+                tick_results[symbol] = {
+                    "signal":      "PRICE_ERROR",
+                    "price":       None,
+                    "in_position": symbol in portfolio.positions,
+                    "price_error": True,
+                }
+                continue
+
             signal = strategy.get_current_signal(df)
 
             # ── 15-min intraday data (already fetched above for open positions) ──
@@ -503,7 +517,13 @@ class Simulator:
                 "in_position": symbol in portfolio.positions,
             }
 
-        current_prices = {s: tick_results[s]["price"] for s in tick_results}
+        # Exclude price-error symbols — None values would break equity calculations
+        # and must not be written into the prices.json disk cache.
+        current_prices = {
+            s: tick_results[s]["price"]
+            for s in tick_results
+            if tick_results[s].get("price") is not None
+        }
         portfolio._record_equity(current_prices)
 
         # Persist portfolio state to disk so it survives app restarts

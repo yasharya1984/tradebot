@@ -19,7 +19,7 @@ import sys
 import os
 import logging
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -562,14 +562,64 @@ simulator_live = st.session_state.simulator_live
 # ──────────────────────────────────────────────────────────
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+# ── NSE public holidays — market closed these dates ───────────────────────────
+# Update annually from the official NSE holiday calendar.
+_NSE_HOLIDAYS: set = {
+    # ── 2025 ──
+    date(2025, 1, 26),  # Republic Day
+    date(2025, 2, 26),  # Maha Shivratri
+    date(2025, 3, 14),  # Holi
+    date(2025, 3, 31),  # Id-Ul-Fitr (Ramzan Eid)
+    date(2025, 4, 14),  # Dr. B.R. Ambedkar Jayanti
+    date(2025, 4, 18),  # Good Friday
+    date(2025, 5,  1),  # Maharashtra Day
+    date(2025, 8, 15),  # Independence Day
+    date(2025, 10, 2),  # Gandhi Jayanti / Dussehra
+    date(2025, 10, 21), # Diwali Laxmi Puja
+    date(2025, 10, 22), # Diwali Balipratipada
+    date(2025, 11,  5), # Gurunanak Jayanti
+    date(2025, 12, 25), # Christmas
+    # ── 2026 (verify against official NSE calendar when published) ──
+    date(2026, 1, 26),  # Republic Day
+    date(2026, 2, 16),  # Maha Shivratri (approx)
+    date(2026, 3,  3),  # Holi (approx)
+    date(2026, 4,  3),  # Good Friday
+    date(2026, 4, 14),  # Dr. B.R. Ambedkar Jayanti
+    date(2026, 5,  1),  # Maharashtra Day
+    date(2026, 8, 15),  # Independence Day
+    date(2026, 10, 2),  # Gandhi Jayanti
+    date(2026, 12, 25), # Christmas
+}
+
+
+def _next_open_dt(after: datetime) -> datetime:
+    """Return the datetime of the next NSE market open (9:15 AM IST) strictly after `after`."""
+    d = (after + timedelta(days=1)).replace(hour=9, minute=15, second=0, microsecond=0)
+    while d.weekday() >= 5 or d.date() in _NSE_HOLIDAYS:
+        d += timedelta(days=1)
+    return d
+
+
+def _next_open_label(now: datetime, nxt: datetime) -> str:
+    """Human-readable label for the next opening time, e.g. 'Opens Mon Apr 20, 9:15 AM IST'."""
+    delta = (nxt.date() - now.date()).days
+    if delta == 1:
+        return "Opens tomorrow 9:15 AM IST"
+    if nxt.weekday() == 0 and delta <= 3:
+        return f"Opens Mon {nxt.strftime('%b %-d')}, 9:15 AM IST"
+    return f"Opens {nxt.strftime('%a %b %-d')}, 9:15 AM IST"
+
+
 def _market_status():
     """Returns (status: str, label: str, secs_until_change: int)."""
-    now = datetime.now(_IST)
-    wd  = now.weekday()  # 0=Mon … 6=Sun
-    if wd >= 5:
-        days = 7 - wd
-        nxt  = (now + timedelta(days=days)).replace(hour=9, minute=15, second=0, microsecond=0)
-        return "CLOSED", f"Opens Mon 9:15 AM IST", int((nxt - now).total_seconds())
+    now   = datetime.now(_IST)
+    today = now.date()
+
+    # ── Weekend or public holiday ──────────────────────────────────────
+    if now.weekday() >= 5 or today in _NSE_HOLIDAYS:
+        nxt  = _next_open_dt(now)
+        return "CLOSED", _next_open_label(now, nxt), int((nxt - now).total_seconds())
+
     mo = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     mc = now.replace(hour=15, minute=30, second=0, microsecond=0)
     if now < mo:
@@ -581,10 +631,9 @@ def _market_status():
         h, r = divmod(diff, 3600); m = r // 60
         return "OPEN", f"Closes in {h}h {m}m", diff
     else:
-        nxt = (now + timedelta(days=1)).replace(hour=9, minute=15, second=0, microsecond=0)
-        if nxt.weekday() >= 5:
-            nxt += timedelta(days=(7 - nxt.weekday()))
-        return "CLOSED", "Opens tomorrow 9:15 AM IST", int((nxt - now).total_seconds())
+        # After market close on a trading day
+        nxt  = _next_open_dt(now)
+        return "CLOSED", _next_open_label(now, nxt), int((nxt - now).total_seconds())
 
 def _fmt_hm(secs: int) -> str:
     h, r = divmod(max(0, secs), 3600); m = r // 60
@@ -748,50 +797,6 @@ label, [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] p { color: #
 </style>
 """, unsafe_allow_html=True)
 
-_JS_CLOCK = """
-<script>
-(function(){
-  var DAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  var MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  function pad(n){return String(n).padStart(2,'0');}
-  function getIST(){return new Date(Date.now()+5.5*3600000);}
-  function mktInfo(ist){
-    var wd=ist.getUTCDay(),h=ist.getUTCHours(),m=ist.getUTCMinutes(),mins=h*60+m;
-    if(wd===0||wd===6)return{s:'CLOSED',c:'#ff6060',l:'Weekend — closed'};
-    if(mins>=555&&mins<=930){var r=930-mins;return{s:'OPEN',c:'#50e880',l:'Closes in '+Math.floor(r/60)+'h '+(r%60)+'m'};}
-    if(mins>=540&&mins<555){var r2=555-mins;return{s:'PRE-OPEN',c:'#f0b429',l:'Opens in '+r2+'m'};}
-    if(mins<540){var r3=555-mins;return{s:'CLOSED',c:'#ff6060',l:'Opens in '+Math.floor(r3/60)+'h '+(r3%60)+'m'};}
-    return{s:'CLOSED',c:'#ff6060',l:'Opens tomorrow 9:15 AM IST'};
-  }
-  function tick(){
-    var ist=getIST(),mi=mktInfo(ist);
-    var ts=DAYS[ist.getUTCDay()]+' '+pad(ist.getUTCDate())+' '+MONTHS[ist.getUTCMonth()]+' '+ist.getUTCFullYear()+' · '+pad(ist.getUTCHours())+':'+pad(ist.getUTCMinutes())+':'+pad(ist.getUTCSeconds())+' IST';
-    var hm=pad(ist.getUTCHours())+':'+pad(ist.getUTCMinutes());
-    ['sb-ist-time','hero-ist-time'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=ts;});
-    ['hero-ist-hm'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=hm;});
-    ['sb-mkt-status','hero-mkt-status'].forEach(function(id){var e=document.getElementById(id);if(e){e.innerText='● '+mi.s;e.style.color=mi.c;}});
-    ['sb-mkt-label','hero-mkt-label'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=mi.l;});
-  }
-  /* Start the clock only after the required DOM nodes are present.
-     Streamlit may hydrate the sidebar after the main content, so we
-     retry up to 20 times (×200 ms = 4 s) before starting unconditionally. */
-  function startClock(){
-    if(window._istTick)clearInterval(window._istTick);
-    window._istTick=setInterval(tick,1000);
-    tick();
-  }
-  var _clockRetries=20;
-  var _clockWait=setInterval(function(){
-    _clockRetries--;
-    if(document.getElementById('sb-mkt-status')||_clockRetries<=0){
-      clearInterval(_clockWait);
-      startClock();
-    }
-  },200);
-})();
-</script>
-"""
-
 
 _JS_CONNECTIVITY = """
 <script>
@@ -939,18 +944,6 @@ with st.sidebar:
     st.markdown("<hr style='border-color:rgba(255,255,255,0.15);margin:10px 0'>",
                 unsafe_allow_html=True)
 
-    # ── Market Status + Clock (JS updates every second client-side) ──
-    st.markdown(
-        "<div style='background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);"
-        "border-radius:10px;padding:10px 14px;margin-top:4px'>"
-        "<div style='color:#90b8e0;font-size:0.7rem;font-weight:700;letter-spacing:0.08em'>NSE MARKET</div>"
-        "<div id='sb-mkt-status' style='font-size:0.95rem;font-weight:800;margin:3px 0'>● ...</div>"
-        "<div id='sb-mkt-label' style='color:#c8ddf4;font-size:0.75rem'>—</div>"
-        "<div id='sb-ist-time' style='color:#7aa8d4;font-size:0.7rem;margin-top:4px'>—</div>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
 
 # ──────────────────────────────────────────────────────────
 # Global view-mode — apply this mode's config on every render
@@ -959,7 +952,7 @@ _vm = st.session_state.get("_view_mode", "sim")
 _apply_mode_config(_vm)
 
 # ──────────────────────────────────────────────────────────
-# Hero header — static parts from Python, clock via JS
+# Hero header — all values computed server-side in Python
 # ──────────────────────────────────────────────────────────
 _run_hero = "—"
 _hero_start = st.session_state.get(f"_bot_start_time_{_vm}")
@@ -967,22 +960,32 @@ if _hero_start:
     _run_hero = _fmt_hm(int((datetime.now() - _hero_start).total_seconds()))
 _mode_badge = "⚡ LIVE" if _vm == "live" else "📊 SIM"
 
+_ist_now = datetime.now(_IST)
+_hero_ist_hm  = _ist_now.strftime("%H:%M")
+_hero_ist_full = _ist_now.strftime("%a %d %b %Y · %H:%M:%S IST")
+_hero_mkt_status, _hero_mkt_label, _ = _market_status()
+
+_mkt_status_color = {
+    "OPEN":     "#50e880",
+    "PRE-OPEN": "#f0b429",
+    "CLOSED":   "#ff6060",
+}.get(_hero_mkt_status, "#ffffff")
+
 st.markdown(
     f"""
     <div class="hero-banner">
       <div>
         <div class="hero-title">📈 Yash's Trading Bot</div>
-        <div class="hero-sub">NSE · NSE 300 Day Trading · <span id="hero-date"></span></div>
+        <div class="hero-sub">NSE · NSE 300 Day Trading · {_hero_ist_full}</div>
       </div>
       <div class="hero-stats">
         <div class="mkt-card">
           <div style="color:#a8ccf0;font-size:0.7rem;font-weight:700;letter-spacing:0.08em">NSE MARKET</div>
-          <div id="hero-mkt-status" style="font-size:0.95rem;font-weight:800;margin:3px 0">● ...</div>
-          <div id="hero-mkt-label" style="font-size:0.75rem;color:#c8ddf4">—</div>
-          <div id="hero-ist-time" style="font-size:0.7rem;color:#7aa8d4">—</div>
+          <div style="font-size:0.95rem;font-weight:800;margin:3px 0;color:{_mkt_status_color}">● {_hero_mkt_status}</div>
+          <div style="font-size:0.75rem;color:#c8ddf4">{_hero_mkt_label}</div>
         </div>
         <div class="hero-stat">
-          <strong id="hero-ist-hm">—</strong>IST Time
+          <strong>{_hero_ist_hm}</strong>IST Time
         </div>
         <div class="hero-stat">
           <strong>{'▶ ' + _run_hero if _hero_start else '⏹ Stopped'}</strong>Bot Running
@@ -992,7 +995,6 @@ st.markdown(
         </div>
       </div>
     </div>
-    {_JS_CLOCK}
     {_JS_CONNECTIVITY}
     """,
     unsafe_allow_html=True,
@@ -1264,13 +1266,20 @@ if _page == "trading":
         #          loaded from disk at startup — always non-empty after the first
         #          time the bot has ever run.
         # Layer 2: prices from the current tick's signals (override disk cache).
+        #          Symbols with price_error=True are NOT promoted to override the
+        #          disk cache — but they are tracked in _price_errors so the UI
+        #          can display ❌ when the market has been open today.
         # Layer 3: entry price used only if neither layer has the symbol.
         _disk_prices: dict = st.session_state.get(f"_cached_prices_{_frag_vm}", {})
 
+        _price_errors: set = set()   # symbols whose LTP fetch failed this tick
         _all_live_prices: dict = dict(_disk_prices)   # start with disk
         for _sr_v in _sim_results.values():
             for _sym_lp, _info_lp in _sr_v.get("signals", {}).items():
-                _all_live_prices[_sym_lp] = _info_lp["price"]  # tick overrides disk
+                if _info_lp.get("price_error"):
+                    _price_errors.add(_sym_lp)          # keep disk-cache; mark error
+                elif _info_lp.get("price") is not None:
+                    _all_live_prices[_sym_lp] = _info_lp["price"]  # tick overrides disk
 
         # ══════════════════════════════════════════════════
         # SECTION A: Portfolio Status
@@ -1532,34 +1541,80 @@ if _page == "trading":
 
                 _pos_obj = _port_positions.get((_strat_k, _sym_ns))
                 if _status == "OPEN" and _pos_obj:
-                    # True if we have any real price (disk cache or live tick)
-                    _has_any_price   = _sym_ns in _all_live_prices
-                    # True only if the current tick (not disk cache) provided it
-                    _is_live_price   = (
+                    # True only if the current tick provided a verified live price
+                    # (excludes price-error symbols so they don't get the ✓ badge)
+                    _is_live_price = (
                         _sym_ns in {
                             sym
                             for sr_v in _sim_results.values()
-                            for sym in sr_v.get("signals", {})
+                            for sym, sig in sr_v.get("signals", {}).items()
+                            if not sig.get("price_error")
                         }
                     )
-                    _lp    = _all_live_prices.get(_sym_ns, _pos_obj.entry_price)
-                    _pnl_v = (_lp - _pos_obj.entry_price) * _pos_obj.quantity
-                    if _is_live_price:
-                        _curr_s = f"₹{_lp:,.2f}"           # fresh from tick
-                    elif _has_any_price:
-                        _curr_s = f"₹{_lp:,.2f} 🕐"       # from disk cache (last sync)
+                    # None when no price data exists at all (no sync yet, no disk cache)
+                    _lp = _all_live_prices.get(_sym_ns)
+                    # Suppress stale P&L when the price is a known error and
+                    # the market has been open today (disk cache = yesterday's close)
+                    _mkt_open_today = fetcher._market_opened_today()
+                    _is_price_error = _sym_ns in _price_errors
+                    _show_stale = _is_price_error and _mkt_open_today
+                    _pnl_v = (
+                        (_lp - _pos_obj.entry_price) * _pos_obj.quantity
+                        if (_lp is not None and not _show_stale) else None
+                    )
+                    if _is_live_price and _lp is not None:
+                        _curr_s = f"₹{_lp:,.2f}"           # verified LTP from tick
+                    elif _is_price_error and _mkt_open_today:
+                        _curr_s = "❌"                      # fetch failed, market open → no stale data
+                    elif _lp is not None:
+                        _curr_s = f"₹{_lp:,.2f} 🕐"       # disk cache (last sync)
                     else:
-                        _curr_s = f"₹{_lp:,.2f} ⏳"       # fallback: entry price
+                        _curr_s = "— ⏳"                   # no price data yet
                     _sl_s   = f"₹{_pos_obj.stop_loss:,.2f}" if _pos_obj.stop_loss else "—"
-                    # Show dynamic exit state instead of static target
+                    # Exit State: show phase with hover tooltip explaining the meaning
                     if getattr(_pos_obj, "tsl_active", False) and _pos_obj.trailing_stop:
-                        _tgt_s = f"TSL ₹{_pos_obj.trailing_stop:,.2f}"
+                        _tsl_val = f"₹{_pos_obj.trailing_stop:,.2f}"
+                        _tgt_s   = f"TSL {_tsl_val}"
+                        _tgt_tip = (
+                            f"Trailing Stop Loss active — locks in gains. "
+                            f"Current floor: {_tsl_val}. "
+                            f"Trails the highest reached price at a fixed % distance. "
+                            f"Exits automatically if price drops to this level."
+                        )
                     elif getattr(_pos_obj, "breakeven_set", False):
-                        _tgt_s = f"BE ₹{_pos_obj.entry_price:,.2f}"
+                        _be_val = f"₹{_pos_obj.entry_price:,.2f}"
+                        _tgt_s  = f"BE {_be_val}"
+                        _tgt_tip = (
+                            f"Break-even protection active. "
+                            f"Stop Loss raised to entry price {_be_val} — "
+                            f"position cannot lose money from here (excluding fees). "
+                            f"Trailing Stop will activate once profit grows further."
+                        )
                     elif getattr(_pos_obj, "gap_state", "none") == "watching":
-                        _tgt_s = "⏳ Gap Watch"
+                        _tgt_s   = "⏳ Gap Watch"
+                        _tgt_tip = (
+                            "Gap-down detected at open — price breached Stop Loss "
+                            "during the opening candle. Holding position until the "
+                            "first 15-min bar closes: green recovery → hold with "
+                            "tighter SL; red / high-volume flush → exit immediately."
+                        )
                     else:
-                        _tgt_s = "SL only"
+                        _sl_pct = round(config.STOP_LOSS_PCT * 100, 1)
+                        _be_pct = round(config.BREAKEVEN_TRIGGER_PCT * 100, 1)
+                        _tsl_pct = round(config.TSL_ACTIVATION_PCT * 100, 1)
+                        _tgt_s   = "SL only"
+                        _tgt_tip = (
+                            f"Initial Stop Loss phase — no profit target is set. "
+                            f"Current SL: {_sl_pct}% below entry. "
+                            f"Phase 1 → SL only (now). "
+                            f"Phase 2 → Break-even: SL moves to entry once profit > {_be_pct}%. "
+                            f"Phase 3 → Trailing Stop activates once profit > {_tsl_pct}%."
+                        )
+                    _tgt_md = (
+                        f"<span title='{_tgt_tip}' "
+                        f"style='cursor:help;border-bottom:1px dashed #888'>"
+                        f"{_tgt_s}</span>"
+                    )
                 else:
                     _exit_p    = _o.get("exit_price")
                     _pnl_v     = _o.get("pnl")
@@ -1567,6 +1622,7 @@ if _page == "trading":
                     _sl_s      = "—"
                     _exit_rsn  = _o.get("exit_reason", "")
                     _tgt_s     = _exit_rsn if _exit_rsn else "—"
+                    _tgt_md    = _tgt_s   # closed rows: plain text, no tooltip needed
 
                 _pnl_col = "#145c2e" if (_pnl_v is not None and _pnl_v >= 0) else "#8b1a1a"
                 _pnl_md  = (
@@ -1604,7 +1660,7 @@ if _page == "trading":
                 _row[4].write(_curr_s)
                 _row[5].markdown(_pnl_md, unsafe_allow_html=True)
                 _row[6].write(_sl_s)
-                _row[7].write(_tgt_s)
+                _row[7].markdown(_tgt_md, unsafe_allow_html=True)
                 _row[8].write(_age)
                 _row[9].markdown(_status_md, unsafe_allow_html=True)
 
