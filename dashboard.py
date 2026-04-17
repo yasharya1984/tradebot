@@ -692,6 +692,38 @@ label, [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] p { color: #
 </style>
 """, unsafe_allow_html=True)
 
+_JS_CLOCK = """
+<script>
+(function(){
+  var DAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  var MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function pad(n){return String(n).padStart(2,'0');}
+  function getIST(){return new Date(Date.now()+5.5*3600000);}
+  function mktInfo(ist){
+    var wd=ist.getUTCDay(),h=ist.getUTCHours(),m=ist.getUTCMinutes(),mins=h*60+m;
+    if(wd===0||wd===6)return{s:'CLOSED',c:'#ff6060',l:'Weekend'};
+    if(mins>=555&&mins<=930){var r=930-mins;return{s:'OPEN',c:'#50e880',l:'Closes in '+Math.floor(r/60)+'h '+(r%60)+'m'};}
+    if(mins>=540&&mins<555){var r2=555-mins;return{s:'PRE-OPEN',c:'#f0b429',l:'Opens in '+r2+'m'};}
+    if(mins<540){var r3=555-mins;return{s:'CLOSED',c:'#ff6060',l:'Opens in '+Math.floor(r3/60)+'h '+(r3%60)+'m'};}
+    return{s:'CLOSED',c:'#ff6060',l:'Opens tomorrow 9:15 AM IST'};
+  }
+  function tick(){
+    var ist=getIST(),mi=mktInfo(ist);
+    var ts=DAYS[ist.getUTCDay()]+' '+pad(ist.getUTCDate())+' '+MONTHS[ist.getUTCMonth()]+' '+ist.getUTCFullYear()+' · '+pad(ist.getUTCHours())+':'+pad(ist.getUTCMinutes())+':'+pad(ist.getUTCSeconds())+' IST';
+    var hm=pad(ist.getUTCHours())+':'+pad(ist.getUTCMinutes());
+    ['sb-ist-time','hero-ist-time'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=ts;});
+    ['hero-ist-hm'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=hm;});
+    ['sb-mkt-status','hero-mkt-status'].forEach(function(id){var e=document.getElementById(id);if(e){e.innerText='● '+mi.s;e.style.color=mi.c;}});
+    ['sb-mkt-label','hero-mkt-label'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerText=mi.l;});
+  }
+  if(window._istTick)clearInterval(window._istTick);
+  window._istTick=setInterval(tick,1000);
+  tick();
+})();
+</script>
+"""
+
+
 # ──────────────────────────────────────────────────────────
 # Sidebar
 # ──────────────────────────────────────────────────────────
@@ -790,39 +822,17 @@ with st.sidebar:
     st.markdown("<hr style='border-color:rgba(255,255,255,0.15);margin:10px 0'>",
                 unsafe_allow_html=True)
 
-    # ── Market Status ─────────────────────────────────────
-    _mstatus, _mlabel, _ = _market_status()
-    _ist_now = datetime.now(_IST)
-    _status_colour = {
-        "OPEN": "#50e880", "PRE-OPEN": "#f0b429", "CLOSED": "#ff6060"
-    }.get(_mstatus, "#c8ddf4")
+    # ── Market Status + Clock (JS updates every second client-side) ──
     st.markdown(
-        f"<div style='background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);"
-        f"border-radius:10px;padding:10px 14px;margin-top:4px'>"
-        f"<div style='color:#90b8e0;font-size:0.7rem;font-weight:700;letter-spacing:0.08em'>"
-        f"NSE MARKET</div>"
-        f"<div style='color:{_status_colour};font-size:0.95rem;font-weight:800;margin:3px 0'>"
-        f"● {_mstatus}</div>"
-        f"<div style='color:#c8ddf4;font-size:0.75rem'>{_mlabel}</div>"
-        f"<div style='color:#7aa8d4;font-size:0.7rem;margin-top:4px'>"
-        f"{_ist_now.strftime('%a %d %b %Y · %H:%M:%S IST')}</div>"
-        f"</div>",
+        "<div style='background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);"
+        "border-radius:10px;padding:10px 14px;margin-top:4px'>"
+        "<div style='color:#90b8e0;font-size:0.7rem;font-weight:700;letter-spacing:0.08em'>NSE MARKET</div>"
+        "<div id='sb-mkt-status' style='font-size:0.95rem;font-weight:800;margin:3px 0'>● ...</div>"
+        "<div id='sb-mkt-label' style='color:#c8ddf4;font-size:0.75rem'>—</div>"
+        "<div id='sb-ist-time' style='color:#7aa8d4;font-size:0.7rem;margin-top:4px'>—</div>"
+        "</div>",
         unsafe_allow_html=True,
     )
-
-    # ── Running time (show both if both are active) ───────
-    _sb_parts = []
-    for _sm, _slbl in (("sim", "📊 Sim"), ("live", "⚡ Live")):
-        _sbt = st.session_state.get(f"_bot_start_time_{_sm}")
-        if _sbt and st.session_state.get(f"paper_running_{_sm}", False):
-            _se = _fmt_hm(int((datetime.now() - _sbt).total_seconds()))
-            _sb_parts.append(f"{_slbl} {_se}")
-    if _sb_parts:
-        st.markdown(
-            f"<div style='color:#7aa8d4;font-size:0.72rem;margin-top:8px;text-align:center'>"
-            f"🟢 {' · '.join(_sb_parts)}</div>",
-            unsafe_allow_html=True,
-        )
 
 
 # ──────────────────────────────────────────────────────────
@@ -832,17 +842,12 @@ _vm = st.session_state.get("_view_mode", "sim")
 _apply_mode_config(_vm)
 
 # ──────────────────────────────────────────────────────────
-# Hero header (shown on every page)
+# Hero header — static parts from Python, clock via JS
 # ──────────────────────────────────────────────────────────
-_mstatus_main, _mlabel_main, _ = _market_status()
-_ist_main = datetime.now(_IST)
-_mcolor_main = {"OPEN": "#50e880", "PRE-OPEN": "#f0b429", "CLOSED": "#ff8080"}.get(_mstatus_main, "#c8ddf4")
-# Running time for current view mode
 _run_hero = "—"
 _hero_start = st.session_state.get(f"_bot_start_time_{_vm}")
 if _hero_start:
-    _e = int((datetime.now() - _hero_start).total_seconds())
-    _run_hero = _fmt_hm(_e)
+    _run_hero = _fmt_hm(int((datetime.now() - _hero_start).total_seconds()))
 _mode_badge = "⚡ LIVE" if _vm == "live" else "📊 SIM"
 
 st.markdown(
@@ -850,17 +855,17 @@ st.markdown(
     <div class="hero-banner">
       <div>
         <div class="hero-title">📈 Yash's Trading Bot</div>
-        <div class="hero-sub">NSE · NSE 300 Day Trading · {_ist_main.strftime('%A, %d %B %Y')}</div>
+        <div class="hero-sub">NSE · NSE 300 Day Trading · <span id="hero-date"></span></div>
       </div>
       <div class="hero-stats">
         <div class="mkt-card">
           <div style="color:#a8ccf0;font-size:0.7rem;font-weight:700;letter-spacing:0.08em">NSE MARKET</div>
-          <div class="status" style="color:{_mcolor_main}">● {_mstatus_main}</div>
-          <div style="font-size:0.75rem;color:#c8ddf4">{_mlabel_main}</div>
-          <div style="font-size:0.7rem;color:#7aa8d4">{_ist_main.strftime('%H:%M:%S IST')}</div>
+          <div id="hero-mkt-status" style="font-size:0.95rem;font-weight:800;margin:3px 0">● ...</div>
+          <div id="hero-mkt-label" style="font-size:0.75rem;color:#c8ddf4">—</div>
+          <div id="hero-ist-time" style="font-size:0.7rem;color:#7aa8d4">—</div>
         </div>
         <div class="hero-stat">
-          <strong>{_ist_main.strftime('%H:%M')}</strong>IST Time
+          <strong id="hero-ist-hm">—</strong>IST Time
         </div>
         <div class="hero-stat">
           <strong>{'▶ ' + _run_hero if _hero_start else '⏹ Stopped'}</strong>Bot Running
@@ -870,6 +875,7 @@ st.markdown(
         </div>
       </div>
     </div>
+    {_JS_CLOCK}
     """,
     unsafe_allow_html=True,
 )
