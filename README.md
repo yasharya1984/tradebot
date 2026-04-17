@@ -6,7 +6,8 @@ An automated NSE (National Stock Exchange) day-trading bot with a Streamlit dash
 
 ## Features
 
-- **Paper Trading** — Simulate trades with virtual capital. All strategies run simultaneously; positions and P&L are tracked in real time.
+- **Dual-Mode Trading** — Run Simulation and Live modes simultaneously. Switch views with a toggle in the sidebar; each mode has fully independent settings, capital, and trade history.
+- **Paper Trading** — Simulate trades with virtual capital. All strategies run in parallel; positions and P&L tracked in real time.
 - **Live Trading** — Place real orders via Zerodha Kite Connect with a configurable capital cap.
 - **3 Trading Strategies** running in parallel:
   - `Moving Average Crossover` — Short/long MA crossover signals
@@ -15,7 +16,7 @@ An automated NSE (National Stock Exchange) day-trading bot with a Streamlit dash
 - **Stock Screener** — Ranks stocks across a 300-symbol NSE universe (100 Large, 100 Mid, 100 Small cap) by momentum score.
 - **Backtester** — Runs any strategy over historical data and compares performance across strategies.
 - **Risk Management** — Stop-loss, profit target, and trailing stop per trade; max position size and max open positions globally.
-- **Streamlit Dashboard** — Live metrics, bot order log, portfolio status, screener results, backtest runner, and settings — all in one page.
+- **Streamlit Dashboard** — Live metrics, bot order log, portfolio status, screener results, backtest runner, and settings — all in one place.
 
 ---
 
@@ -24,19 +25,14 @@ An automated NSE (National Stock Exchange) day-trading bot with a Streamlit dash
 ### 1. Install dependencies
 
 ```bash
-pip install streamlit yfinance pandas ta
+pip install streamlit yfinance pandas ta plotly
 # For live trading only:
 pip install kiteconnect
 ```
 
 ### 2. Configure
 
-Edit `config.py`:
-
-```python
-CAPITAL = 100_000          # Starting capital in INR
-MODE    = "simulation"     # "simulation" or "live"
-```
+Edit `config.py` to set your starting capital and risk parameters. No need to set `MODE` — the dashboard toggle handles that at runtime.
 
 ### 3. Launch the dashboard
 
@@ -60,18 +56,42 @@ python main.py dashboard
 
 ---
 
-## Dashboard Pages
+## Dashboard
+
+### Navigation
+
+The sidebar is always visible (fixed, no collapse). The top of the sidebar has a **📊 Sim / ⚡ Live** toggle that switches the entire dashboard between modes. Below it are the six navigation items:
 
 | Page | Description |
 |---|---|
-| **Trading** | Start/pause/restart the bot; live order table; portfolio status with per-strategy breakdown |
+| **Trading** | Start/stop the bot; live order table; portfolio status with per-strategy breakdown |
 | **Overview** | Equity curve, cumulative P&L, win rate summary across strategies |
 | **History** | Filterable trade history with export |
-| **Screener** | Live momentum ranking of NSE stocks with buy/sell signals |
+| **Screener** | Live momentum ranking of NSE 300 stocks with buy/sell signals |
 | **Backtest** | Run strategies over a custom date range; compare total return, Sharpe, drawdown |
-| **Settings** | Adjust all risk and strategy parameters without restarting |
+| **Settings** | Adjust all risk and strategy parameters (independent per mode) |
 
-The sidebar shows market open/close countdown and bot running time. Mode (Simulator / Live) is a sub-menu under Trading.
+### URL-based navigation
+
+Each page and mode is reflected in the browser URL (e.g. `?page=settings&mode=live`). Refreshing the browser returns you to the same page and mode. You can also open two browser tabs — one with `?mode=sim` and one with `?mode=live` — to monitor both modes side by side.
+
+### Live clock
+
+The sidebar and hero banner both show a live NSE market status (OPEN / PRE-OPEN / CLOSED), countdown to open/close, and current IST time with seconds — all updating every second client-side.
+
+---
+
+## Simulation vs Live Mode
+
+Both modes run independently in parallel. Switching the toggle only changes which mode you are *viewing* — it does not stop or start either bot.
+
+| | Simulation (📊) | Live (⚡) |
+|---|---|---|
+| Orders | Virtual (no real money) | Real orders via Zerodha Kite |
+| Theme | Blue | Gold / Amber |
+| Settings | Independent | Independent |
+| Capital | Configurable virtual amount | Capped by `LIVE_TRADING_CAP` |
+| History | Stored in `trade_data/sim/` | Stored in `trade_data/live/` |
 
 ---
 
@@ -83,7 +103,7 @@ The sidebar shows market open/close countdown and bot running time. Mode (Simula
 |---|---|---|
 | `CAPITAL` | ₹1,00,000 | Starting virtual capital |
 | `MAX_POSITION_PCT` | 20% | Max capital in any single stock |
-| `MAX_OPEN_POSITIONS` | 10 | Max concurrent positions |
+| `MAX_OPEN_POSITIONS` | 10 | Max concurrent open positions |
 | `STOP_LOSS_PCT` | 2% | Stop-loss per trade |
 | `TARGET_PCT` | 4% | Profit target per trade |
 | `TRAILING_STOP_PCT` | 1.5% | Trailing stop once in profit |
@@ -113,17 +133,13 @@ Universe: 300 NSE symbols — 100 Large Cap, 100 Mid Cap, 100 Small Cap.
 > **Always run in simulation mode first before going live.**
 
 1. Apply for a Kite Connect API key at https://developers.kite.trade/ (approx ₹2000/month)
-2. Add your credentials to `config.py`:
-   ```python
-   ZERODHA_API_KEY    = "your_api_key"
-   ZERODHA_API_SECRET = "your_api_secret"
-   ```
+2. Switch to ⚡ Live mode in the sidebar and go to **Settings → Zerodha API Credentials**. Enter your API key and secret there.
 3. Each morning before market open, generate a fresh access token:
    ```bash
    python main.py token
    ```
    Follow the login URL printed, copy the `request_token` from the redirect URL, paste it into `config.py`, and re-run the command.
-4. Set `MODE = "live"` in `config.py` or toggle Live in the dashboard sidebar.
+4. Toggle to ⚡ Live in the sidebar and start the bot from the Trading page.
 
 > SEBI requires an audit trail for algo trades. This bot logs all orders to `trade_data/live/orders.json`.
 
@@ -163,4 +179,4 @@ NSE market hours: 9:15 AM – 3:30 PM IST, Monday–Friday (excluding exchange h
 
 ---
 
-© 2024 Yash Arya. Personal use only.
+© 2025 Yash Arya. Personal use only.
