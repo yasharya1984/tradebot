@@ -16,6 +16,13 @@ trade_data/
 kite_access_token.txt
 access_token.txt
 
+# TLS certificates — NEVER commit private keys or client certs
+certs/
+*.key
+*.p12
+*.pfx
+*.pem
+
 # OS
 .DS_Store
 Thumbs.db

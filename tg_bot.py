@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 # Credentials
 # ─────────────────────────────────────────────────────────────
-BOT_TOKEN  = "8792563638:AAGnC8J3PXsUWZTiXyJoHNygWbkcqs2cyK4"
-MY_CHAT_ID = 5582749951   # int — compared against update.effective_user.id (also int)
+BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN",  "8792563638:AAGnC8J3PXsUWZTiXyJoHNygWbkcqs2cyK4")
+MY_CHAT_ID = int(os.environ.get("TG_CHAT_ID", "5582749951"))   # compared against update.effective_user.id (int)
 
 
 # ─────────────────────────────────────────────────────────────

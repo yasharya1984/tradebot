@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import config
+import github_sync
 from data_fetcher import DataFetcher
 from ip_guard import verify_ip_compliance, log_ip_once, start_ip_heartbeat
 from market_utils import is_market_open as _market_is_open_util
@@ -56,9 +57,23 @@ def print_banner():
 def cmd_dashboard():
     """Launch the Streamlit dashboard."""
     print_banner()
-    print("🌐 Launching dashboard at http://localhost:8501 ...")
-    #subprocess.run(["streamlit", "run", "dashboard.py", "--server.headless", "false"])
-    subprocess.run([sys.executable, "-m", "streamlit", "run", "dashboard.py", "--server.headless", "false"])
+    # In Docker (IN_DOCKER=1) bind to 0.0.0.0 and suppress browser auto-open.
+    # Locally, keep the default localhost binding so the browser opens automatically.
+    import os as _os
+    if _os.environ.get("IN_DOCKER"):
+        args = [
+            sys.executable, "-m", "streamlit", "run", "dashboard.py",
+            "--server.headless", "true",
+            "--server.address", "0.0.0.0",
+            "--server.port", "8501",
+            "--server.enableCORS", "false",
+        ]
+        print("Launching dashboard at http://0.0.0.0:8501 (Docker mode)...")
+    else:
+        args = [sys.executable, "-m", "streamlit", "run", "dashboard.py",
+                "--server.headless", "false"]
+        print("Launching dashboard at http://localhost:8501 ...")
+    subprocess.run(args)
 
 def cmd_backtest():
     """Run full strategy comparison backtest in terminal."""
@@ -110,6 +125,9 @@ def cmd_screener():
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN  = (9, 15)   # 9:15 AM IST
 MARKET_CLOSE = (15, 30)  # 3:30 PM IST
+
+# GitHub sync interval: push trade_data every 15 minutes while market is open
+_GITHUB_SYNC_INTERVAL_S = 15 * 60   # 900 seconds
 
 
 def _market_is_open() -> bool:
@@ -215,16 +233,30 @@ def cmd_paper():
         f"(interval: {interval}s). Press Ctrl+C to stop."
     )
     tick = 0
+    _last_github_sync   = 0.0   # epoch seconds of last successful push
+    _market_was_open    = False  # tracks open→close transition for end-of-day sync
+
     try:
         while True:
             now_ist = datetime.now(IST)
-            if not _market_is_open():
+            market_open_now = _market_is_open()
+
+            if not market_open_now:
+                # ── End-of-day final sync (fires once when market closes) ──
+                if _market_was_open:
+                    logger.info("Market just closed — running final GitHub sync...")
+                    github_sync.push_to_github()
+                    _last_github_sync = time.time()
+                    _market_was_open  = False
+
                 open_str  = f"{MARKET_OPEN[0]:02d}:{MARKET_OPEN[1]:02d}"
                 close_str = f"{MARKET_CLOSE[0]:02d}:{MARKET_CLOSE[1]:02d}"
                 print(f"\n[{now_ist.strftime('%H:%M:%S')} IST] Market closed "
                       f"(hours: {open_str}–{close_str} IST). Waiting...")
                 time.sleep(60)
                 continue
+
+            _market_was_open = True
 
             # Market is open — promote any orders queued during closure
             import bot_orders as _bo
@@ -241,10 +273,21 @@ def cmd_paper():
             )
             print(f"{'='*60}")
             _run_one_tick(simulator)
+
+            # ── Periodic GitHub sync every 15 minutes ────────────
+            if time.time() - _last_github_sync >= _GITHUB_SYNC_INTERVAL_S:
+                logger.info("Running scheduled GitHub sync (every 15 min)...")
+                result = github_sync.push_to_github()
+                if not result.get("skipped"):
+                    logger.info("GitHub sync: %s", result)
+                _last_github_sync = time.time()
+
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        print(f"\n\nStopped by user. Final {trade_mode} portfolio state:")
+        print(f"\n\nStopped by user — running final GitHub sync...")
+        github_sync.push_to_github()
+        print(f"Final {trade_mode} portfolio state:")
         _run_one_tick(simulator)
 
 

@@ -1,0 +1,180 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────────────
+# India NSE Trading Bot — Docker Compose (mTLS Production)
+#
+# Architecture:
+#   Internet → Nginx (443, mTLS) → trading-bot:8501 (internal only)
+#
+# Security:
+#   • Only Nginx is exposed to the public internet (port 443)
+#   • trading-bot has NO exposed ports — reachable only on bot_net
+#   • Client certificate required for dashboard access
+#   • TLS 1.2/1.3 with strong ciphers only
+#
+# Setup (first time):
+#   1. SERVER_IP=<lightsail-ip> ./generate_certs.sh
+#   2. cp .env.example .env && edit .env
+#   3. docker compose up -d
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ══════════════════════════════════════════════════════════════════
+  # NGINX — Public-facing reverse proxy with Mutual TLS
+  # ══════════════════════════════════════════════════════════════════
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: trading-nginx
+    restart: unless-stopped
+
+    ports:
+      - "80:80"    # HTTP → HTTPS redirect only
+      - "443:443"  # HTTPS + mTLS (dashboard access)
+
+    volumes:
+      # Nginx configuration (read-only)
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # TLS certificates (read-only — never writeable from container)
+      - ./certs/server.crt:/certs/server.crt:ro
+      - ./certs/server.key:/certs/server.key:ro
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      # Shared log volume — mtls-watcher reads access.log from here
+      - nginx_logs:/var/log/nginx
+
+    networks:
+      - bot_net
+
+    depends_on:
+      trading-bot:
+        condition: service_healthy
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ══════════════════════════════════════════════════════════════════
+  # MTLS WATCHER — Telegram security alert sidecar
+  # Tails /var/log/nginx/access.log (shared with nginx via nginx_logs
+  # volume) and sends a Telegram alert on every successful mTLS login.
+  # ══════════════════════════════════════════════════════════════════
+  mtls-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.watcher
+    container_name: trading-mtls-watcher
+    restart: unless-stopped
+
+    environment:
+      # ── Telegram credentials (required) ──────────────────────────
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
+      - TG_CHAT_ID=${TG_CHAT_ID:-}
+
+      # ── Optional tuning ───────────────────────────────────────────
+      # Alert cooldown per source IP (seconds). Prevents duplicate
+      # alerts from Streamlit's many parallel sub-resource requests.
+      - DEDUP_WINDOW_SECONDS=${DEDUP_WINDOW_SECONDS:-60}
+
+      # Path to the nginx access log inside the container
+      - NGINX_ACCESS_LOG=/var/log/nginx/access.log
+
+    volumes:
+      # Read-only view of the same nginx log directory
+      - nginx_logs:/var/log/nginx:ro
+
+    networks:
+      - bot_net
+
+    depends_on:
+      - nginx
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════
+  # TRADING BOT — Internal only (no public ports)
+  # ══════════════════════════════════════════════════════════════════
+  trading-bot:
+    image: ${DOCKER_IMAGE:-youruser/trading-bot:latest}
+    container_name: trading-bot
+    restart: unless-stopped
+
+    # ── CRITICAL: NO ports section ────────────────────────────────
+    # Streamlit (8501) is reachable ONLY from nginx on bot_net.
+    # Exposing it to the host would bypass mTLS completely.
+
+    environment:
+      # ── Zerodha Kite API ──────────────────────────────────────
+      - ZERODHA_API_KEY=${ZERODHA_API_KEY}
+      - ZERODHA_API_SECRET=${ZERODHA_API_SECRET}
+      - ZERODHA_ACCESS_TOKEN=${ZERODHA_ACCESS_TOKEN:-}
+      - ZERODHA_REQUEST_TOKEN=${ZERODHA_REQUEST_TOKEN:-}
+
+      # ── Trading mode: "simulation" or "live" ─────────────────
+      - TRADING_MODE=${TRADING_MODE:-simulation}
+
+      # ── SEBI static-IP whitelist (comma-separated) ────────────
+      - ALLOWED_IPS=${ALLOWED_IPS:-}
+
+      # ── GitHub persistent storage ─────────────────────────────
+      - GITHUB_PAT=${GITHUB_PAT}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
+
+      # ── Telegram notifications ────────────────────────────────
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
+      - TG_CHAT_ID=${TG_CHAT_ID:-}
+
+    volumes:
+      # Named volume — survives container restart
+      # GitHub sync provides the cross-deployment backup
+      - trade_data:/app/trade_data
+
+    networks:
+      - bot_net
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8501/_stcore/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+# ─────────────────────────────────────────────────────────────────────
+# NETWORKS
+# ─────────────────────────────────────────────────────────────────────
+networks:
+  bot_net:
+    driver: bridge
+    # internal: false  ← containers need outbound internet
+    #   (yfinance data, GitHub sync, Telegram, Zerodha Kite API)
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+# ─────────────────────────────────────────────────────────────────────
+# VOLUMES
+# ─────────────────────────────────────────────────────────────────────
+volumes:
+  trade_data:
+    driver: local
+  # Shared between nginx (writer) and mtls-watcher (reader)
+  nginx_logs:
+    driver: local

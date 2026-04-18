@@ -1,8 +1,14 @@
 """
 Trading Bot Configuration
 =========================
-Edit this file to configure your bot before running.
+All sensitive values are read from environment variables first, then fall
+back to the hardcoded defaults below. In production (Docker / Lightsail)
+set everything via docker-compose.yml → .env file; never commit secrets.
+
+Priority: environment variable > value below.
 """
+
+import os
 
 # ─────────────────────────────────────────────
 # CAPITAL & RISK SETTINGS
@@ -40,10 +46,10 @@ MIN_PNL_TO_BOOK    = 200     # Minimum ₹200 P&L to execute a signal exit
 #     • margins (account balance)
 # No Historical Data or Full Quotes API calls are made.
 # ─────────────────────────────────────────────
-ZERODHA_API_KEY = "your_api_key_here"
-ZERODHA_API_SECRET = "your_api_secret_here"
-ZERODHA_ACCESS_TOKEN = ""    # Generated each day via login flow
-ZERODHA_REQUEST_TOKEN = ""   # Paste after OAuth redirect
+ZERODHA_API_KEY      = os.environ.get("ZERODHA_API_KEY",      "your_api_key_here")
+ZERODHA_API_SECRET   = os.environ.get("ZERODHA_API_SECRET",   "your_api_secret_here")
+ZERODHA_ACCESS_TOKEN = os.environ.get("ZERODHA_ACCESS_TOKEN", "")   # Generated daily via login flow
+ZERODHA_REQUEST_TOKEN= os.environ.get("ZERODHA_REQUEST_TOKEN","")   # Paste after OAuth redirect
 
 # ─────────────────────────────────────────────
 # SEBI STATIC-IP COMPLIANCE (April 2026 mandate)
@@ -57,7 +63,9 @@ ZERODHA_REQUEST_TOKEN = ""   # Paste after OAuth redirect
 # Example:
 #   ALLOWED_IPS = ["203.0.113.10", "198.51.100.42"]
 # ─────────────────────────────────────────────
-ALLOWED_IPS: list = []   # e.g. ["your.static.ip.here"]
+# Read from env var as comma-separated string, e.g. "203.0.113.10,198.51.100.42"
+_allowed_ips_env = os.environ.get("ALLOWED_IPS", "")
+ALLOWED_IPS: list = [ip.strip() for ip in _allowed_ips_env.split(",") if ip.strip()]
 
 # ─────────────────────────────────────────────
 # TRADING MODE
@@ -70,7 +78,7 @@ ALLOWED_IPS: list = []   # e.g. ["your.static.ip.here"]
 #   SimBroker  → writes to trade_data/sim/
 #   LiveBroker → calls Kite API + writes to trade_data/live/
 # ─────────────────────────────────────────────
-MODE = "simulation"
+MODE = os.environ.get("TRADING_MODE", "simulation")
 
 # ─────────────────────────────────────────────
 # LIVE TRADING CAP

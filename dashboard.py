@@ -1051,7 +1051,11 @@ if _page == "trading":
     # ── Controls row ─────────────────────────────────────────
     _cur_sim = st.session_state.simulator_live if is_live else st.session_state.simulator_sim
 
-    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([3, 1, 1, 1, 2])
+    if is_live:
+        ctrl1, ctrl2, ctrl3, ctrl5 = st.columns([3, 1, 1, 2])
+        ctrl4 = None
+    else:
+        ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([3, 1, 1, 1, 2])
     strategies_to_run = ctrl1.multiselect(
         "Strategies",
         list(STRATEGY_MAP.keys()),
@@ -1075,10 +1079,14 @@ if _page == "trading":
         type="primary",
         use_container_width=True,
     )
-    restart_btn = ctrl4.button(
-        "🔄 Restart",
-        help="Delete all saved trades for this mode and start from scratch.",
-        use_container_width=True,
+    restart_btn = (
+        ctrl4.button(
+            "🔄 Restart",
+            help="Delete all saved trades for this mode and start from scratch.",
+            use_container_width=True,
+        )
+        if ctrl4 is not None
+        else False
     )
 
     # ── Start / Pause handler ─────────────────────────────────
@@ -1106,12 +1114,45 @@ if _page == "trading":
                     st.warning(f"Kite connect error: {_e}")
 
             _cur_sim.initialize_paper_trading(strategies_to_run, mode=_trade_mode)
+
+            # ── Auto-sync with Kite on live start ────────────────
+            # Load existing Kite positions and funds so every trading
+            # decision is made with an accurate view of the account.
+            if is_live:
+                _kite_t = st.session_state.get("_kite_trader")
+                if _kite_t and _kite_t.is_connected:
+                    _total_loaded = 0
+                    for _strat in strategies_to_run:
+                        _sync_res = _cur_sim.sync_live_portfolio(_strat, _kite_t)
+                        _total_loaded += _sync_res.get("positions_loaded", 0)
+
+                    # Align portfolio cash with actual Kite available funds
+                    # (capped at LIVE_TRADING_CAP so the bot never over-commits).
+                    try:
+                        _funds = _kite_t.get_account_balance()
+                        _kite_cash = _funds.get("available_cash")
+                        if _kite_cash is not None:
+                            _cap = getattr(config, "LIVE_TRADING_CAP", None) or getattr(config, "CAPITAL", None)
+                            _synced_cash = min(float(_kite_cash), float(_cap)) if _cap else float(_kite_cash)
+                            for _strat in strategies_to_run:
+                                _p = _cur_sim.get_paper_portfolio(_strat)
+                                if _p is not None:
+                                    _p.cash = _synced_cash
+                    except Exception as _fe:
+                        logger.warning(f"Could not sync Kite funds: {_fe}")
+
+                    if _total_loaded:
+                        st.info(f"📥 Synced {_total_loaded} existing Kite position(s) into the bot.")
+
             st.session_state[f"_bg_thread_{_vm}"]             = None
             st.session_state[f"_bg_last_update_{_vm}"]        = None
             st.session_state[f"_tick_done_event_{_vm}"]       = threading.Event()
             st.session_state[f"_tick_result_{_vm}"]           = {}
             st.session_state[f"_bot_start_time_{_vm}"]        = datetime.now()
             st.success(
+                f"{'Live' if is_live else 'Paper'} trading started — "
+                "synced with Kite and continuing from existing state."
+                if is_live else
                 f"{'Live' if is_live else 'Paper'} trading started — "
                 "saved state loaded where available."
             )

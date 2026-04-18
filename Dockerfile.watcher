@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.watcher — mTLS Access Log Watcher (sidecar)
+#
+# Minimal Alpine-based Python image.
+# Tails the shared nginx access log and sends Telegram alerts on
+# successful mTLS dashboard logins.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM python:3.11-alpine
+
+WORKDIR /app
+
+# requests is the only runtime dependency
+RUN pip install --no-cache-dir requests==2.32.3
+
+COPY mtls_watcher.py .
+
+# Unbuffered output so logs appear immediately in `docker logs`
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-u", "mtls_watcher.py"]
