@@ -6,10 +6,14 @@ Tracks every BUY / SELL action the bot takes (sim or live).
 Stored in  trade_data/{mode}/orders.json  as a flat JSON list.
 
 Order status lifecycle:
+  PENDING   – Signal generated but market is closed; order queued for next open
   OPEN      – BUY placed/executed, position is currently held
   EXECUTED  – Both legs done; position fully closed with P&L
   CANCELLED – Manually force-closed by the user before normal exit
   REJECTED  – (live only) Order was rejected by the broker
+
+  State transition:  PENDING → OPEN  (on next market open via promote_pending_orders)
+                     OPEN    → EXECUTED | CANCELLED | REJECTED
 
 Each record:
   order_id    – UUID (sim) or Kite order_id (live)
@@ -20,8 +24,9 @@ Each record:
   exit_price  – price at which the SELL was executed (once closed)
   strategy    – strategy name
   mode        – "sim" | "live"
-  status      – OPEN | EXECUTED | CANCELLED | REJECTED
-  placed_at   – ISO-8601 timestamp of the BUY
+  status      – PENDING | OPEN | EXECUTED | CANCELLED | REJECTED
+  placed_at   – ISO-8601 timestamp of the BUY signal
+  opened_at   – ISO-8601 timestamp when PENDING → OPEN (None for same-day fills)
   closed_at   – ISO-8601 timestamp of the SELL (once done)
   exit_reason – "Stop Loss" | "Take Profit" | "Trailing Stop" |
                 "Strategy Signal" | "Manual Cancel" | …
@@ -36,6 +41,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+
+from market_utils import is_market_open
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +93,17 @@ def log_open(
     kite_order_id: Optional[str] = None,
 ) -> str:
     """
-    Record a new position opening (BUY executed).
+    Record a new position opening (BUY signal received).
+
+    Status is set automatically based on current market hours:
+    - Market OPEN  → status "OPEN"   (order fills immediately)
+    - Market CLOSED → status "PENDING" (queued until next market open)
+
     Returns the generated order_id.
     """
     orders = _load_raw(mode)
-    oid = kite_order_id or str(uuid.uuid4())[:12]
+    oid    = kite_order_id or str(uuid.uuid4())[:12]
+    status = "OPEN" if is_market_open() else "PENDING"
     orders.append({
         "order_id":     oid,
         "symbol":       symbol,
@@ -100,8 +113,9 @@ def log_open(
         "exit_price":   None,
         "strategy":     strategy,
         "mode":         mode,
-        "status":       "OPEN",
+        "status":       status,
         "placed_at":    datetime.now().isoformat(),
+        "opened_at":    datetime.now().isoformat() if status == "OPEN" else None,
         "closed_at":    None,
         "exit_reason":  None,
         "pnl":          None,
@@ -109,7 +123,9 @@ def log_open(
         "kite_sell_id": None,
     })
     _save_raw(mode, orders)
-    logger.debug(f"bot_orders: logged OPEN {symbol} ×{quantity} @ ₹{price:.2f} [{mode}]")
+    logger.debug(
+        f"bot_orders: logged {status} {symbol} ×{quantity} @ ₹{price:.2f} [{mode}]"
+    )
     return oid
 
 
@@ -122,11 +138,12 @@ def log_close(
     kite_sell_id: Optional[str] = None,
 ) -> None:
     """
-    Mark the most-recent OPEN order for *symbol* as EXECUTED.
+    Mark the most-recent OPEN (or PENDING) order for *symbol* as EXECUTED.
+    PENDING orders that are closed before ever opening are still recorded with full P&L.
     """
     orders = _load_raw(mode)
     for order in reversed(orders):
-        if order["symbol"] == symbol and order["status"] == "OPEN":
+        if order["symbol"] == symbol and order["status"] in ("OPEN", "PENDING"):
             order["status"]       = "EXECUTED"
             order["exit_price"]   = round(exit_price, 2)
             order["closed_at"]    = datetime.now().isoformat()
@@ -140,16 +157,41 @@ def log_close(
 
 
 def log_cancel(symbol: str, mode: str = "sim") -> None:
-    """Mark the most-recent OPEN order for *symbol* as CANCELLED."""
+    """Mark the most-recent OPEN or PENDING order for *symbol* as CANCELLED."""
     orders = _load_raw(mode)
     for order in reversed(orders):
-        if order["symbol"] == symbol and order["status"] == "OPEN":
-            order["status"]    = "CANCELLED"
-            order["closed_at"] = datetime.now().isoformat()
+        if order["symbol"] == symbol and order["status"] in ("OPEN", "PENDING"):
+            order["status"]      = "CANCELLED"
+            order["closed_at"]   = datetime.now().isoformat()
             order["exit_reason"] = "Manual Cancel"
             break
     _save_raw(mode, orders)
     logger.info(f"bot_orders: logged CANCEL {symbol} [{mode}]")
+
+
+def promote_pending_orders(mode: str = "sim") -> int:
+    """
+    Transition all PENDING orders to OPEN now that the market has opened.
+
+    Should be called once at the start of the first tick after market open.
+    Returns the number of orders promoted.
+    """
+    if not is_market_open():
+        return 0
+    orders  = _load_raw(mode)
+    count   = 0
+    now_iso = datetime.now().isoformat()
+    for order in orders:
+        if order.get("status") == "PENDING":
+            order["status"]    = "OPEN"
+            order["opened_at"] = now_iso
+            count += 1
+    if count:
+        _save_raw(mode, orders)
+        logger.info(
+            f"bot_orders: promoted {count} PENDING → OPEN [{mode}] at market open"
+        )
+    return count
 
 
 def get_all_orders(mode: str = "sim") -> List[dict]:
@@ -196,6 +238,7 @@ def age_str(iso_ts: Optional[str]) -> str:
 
 
 _STATUS_COLOUR = {
+    "PENDING":   ("#5a3e00", "#fff8e1"),   # dark-amber text, pale-yellow bg
     "OPEN":      ("#1a4f8a", "#dce8f8"),   # blue text, light blue bg
     "EXECUTED":  ("#145c2e", "#e6f9ee"),   # green text, light green bg
     "CANCELLED": ("#7a4800", "#fff3d4"),   # amber text, light amber bg

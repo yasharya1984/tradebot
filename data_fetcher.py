@@ -18,6 +18,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
+from market_utils import NSE_HOLIDAYS, is_market_open as _mu_is_market_open
+
 logger = logging.getLogger(__name__)
 
 # Maximum symbols per single yf.download() call.
@@ -546,22 +548,18 @@ class DataFetcher:
 
     def _market_opened_today(self) -> bool:
         """
-        True if the NSE market has already opened today (even if currently closed).
-        Weekday AND IST time ≥ 09:15.  Used for staleness checks.
+        True if the NSE market has already opened today (even if currently closed after 15:30).
+        Returns False on weekends and NSE holidays.  Used for price-staleness checks.
         """
-        now = datetime.now(ZoneInfo("Asia/Kolkata"))
-        if now.weekday() >= 5:
+        now   = datetime.now(ZoneInfo("Asia/Kolkata"))
+        today = now.date()
+        if now.weekday() >= 5 or today in NSE_HOLIDAYS:
             return False
         return now.hour > 9 or (now.hour == 9 and now.minute >= 15)
 
     def is_market_open(self) -> bool:
-        """Check if NSE market is currently open (9:15 AM – 3:30 PM IST, Mon–Fri)."""
-        now = datetime.now(ZoneInfo("Asia/Kolkata"))
-        if now.weekday() >= 5:  # Saturday/Sunday
-            return False
-        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        return market_open <= now <= market_close
+        """Check if NSE market is currently open (9:15 AM – 3:30 PM IST, Mon–Fri, non-holiday)."""
+        return _mu_is_market_open()
 
     def clear_cache(self):
         """Clear all cached data."""

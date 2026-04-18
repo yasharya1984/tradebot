@@ -19,7 +19,7 @@ import sys
 import os
 import logging
 import threading
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -32,6 +32,8 @@ import config
 import trade_store
 import bot_orders as _bot_orders
 from data_fetcher import DataFetcher
+from ip_guard import get_public_ip, log_ip_once
+from market_utils import NSE_HOLIDAYS as _NSE_HOLIDAYS_MU, is_market_open as _is_market_open
 from stock_selector import StockSelector
 from simulator import Simulator
 from strategies import STRATEGY_MAP
@@ -562,34 +564,8 @@ simulator_live = st.session_state.simulator_live
 # ──────────────────────────────────────────────────────────
 _IST = timezone(timedelta(hours=5, minutes=30))
 
-# ── NSE public holidays — market closed these dates ───────────────────────────
-# Update annually from the official NSE holiday calendar.
-_NSE_HOLIDAYS: set = {
-    # ── 2025 ──
-    date(2025, 1, 26),  # Republic Day
-    date(2025, 2, 26),  # Maha Shivratri
-    date(2025, 3, 14),  # Holi
-    date(2025, 3, 31),  # Id-Ul-Fitr (Ramzan Eid)
-    date(2025, 4, 14),  # Dr. B.R. Ambedkar Jayanti
-    date(2025, 4, 18),  # Good Friday
-    date(2025, 5,  1),  # Maharashtra Day
-    date(2025, 8, 15),  # Independence Day
-    date(2025, 10, 2),  # Gandhi Jayanti / Dussehra
-    date(2025, 10, 21), # Diwali Laxmi Puja
-    date(2025, 10, 22), # Diwali Balipratipada
-    date(2025, 11,  5), # Gurunanak Jayanti
-    date(2025, 12, 25), # Christmas
-    # ── 2026 (verify against official NSE calendar when published) ──
-    date(2026, 1, 26),  # Republic Day
-    date(2026, 2, 16),  # Maha Shivratri (approx)
-    date(2026, 3,  3),  # Holi (approx)
-    date(2026, 4,  3),  # Good Friday
-    date(2026, 4, 14),  # Dr. B.R. Ambedkar Jayanti
-    date(2026, 5,  1),  # Maharashtra Day
-    date(2026, 8, 15),  # Independence Day
-    date(2026, 10, 2),  # Gandhi Jayanti
-    date(2026, 12, 25), # Christmas
-}
+# ── NSE public holidays — sourced from market_utils (single source of truth) ─
+_NSE_HOLIDAYS = _NSE_HOLIDAYS_MU
 
 
 def _next_open_dt(after: datetime) -> datetime:
@@ -671,6 +647,13 @@ def _paper_tick_worker(
     Writes results into *result_container* and sets *done_event*.
     Never touches st.session_state to avoid 'missing ScriptRunContext'.
     """
+    # Promote any PENDING orders queued during market closure to OPEN now
+    # that the market is open.  safe to call every tick — no-ops when closed.
+    mode = sim._trade_mode  # "sim" or "live"
+    promoted = _bot_orders.promote_pending_orders(mode)
+    if promoted:
+        logger.info(f"Tick worker: promoted {promoted} PENDING → OPEN [{mode}]")
+
     results = {}
     for strat in strategies:
         try:
@@ -877,7 +860,7 @@ with st.sidebar:
     )
     with _tc2:
         _sb_live = st.toggle(
-            "",
+            "Sim / Live",
             value=_is_live_now,
             key="sidebar_mode_toggle",
             label_visibility="collapsed",
@@ -971,12 +954,21 @@ _mkt_status_color = {
     "CLOSED":   "#ff6060",
 }.get(_hero_mkt_status, "#ffffff")
 
+# Public IP — fetched once per session and cached to avoid a network call on
+# every page render.  Falls back to "—" gracefully if the lookup fails.
+if "_cached_public_ip" not in st.session_state:
+    try:
+        st.session_state["_cached_public_ip"] = get_public_ip() or "—"
+    except Exception:
+        st.session_state["_cached_public_ip"] = "—"
+_hero_ip = st.session_state["_cached_public_ip"]
+
 st.markdown(
     f"""
     <div class="hero-banner">
       <div>
         <div class="hero-title">📈 Yash's Trading Bot</div>
-        <div class="hero-sub">NSE · NSE 300 Day Trading · {_hero_ist_full}</div>
+        <div class="hero-sub">NSE · NSE 300 Day Trading · {_hero_ist_full} · IP: {_hero_ip}</div>
       </div>
       <div class="hero-stats">
         <div class="mkt-card">
@@ -1467,7 +1459,7 @@ if _page == "trading":
 
         _bf1, _bf2, _bf3 = st.columns(3)
         _ord_status = _bf1.selectbox(
-            "Status", ["All", "OPEN", "EXECUTED", "CANCELLED"], key="ord_status_sel",
+            "Status", ["All", "PENDING", "OPEN", "EXECUTED", "CANCELLED"], key="ord_status_sel",
         )
         _ord_time = _bf2.selectbox(
             "Placed within",
@@ -1500,6 +1492,36 @@ if _page == "trading":
             _all_orders = [o for o in _all_orders if o.get("status") == _ord_status]
         if _ord_strat != "All":
             _all_orders = [o for o in _all_orders if o.get("strategy") == _ord_strat]
+
+        # ── Kite disconnection guard (live mode only) ──────────────────────
+        # Determine whether Kite is actually connected for this session.
+        _kite_trader_inst = st.session_state.get("_kite_trader")
+        _kite_is_connected = (
+            _frag_live
+            and _kite_trader_inst is not None
+            and not _kite_data.get("error")
+        )
+        if _frag_live and not _kite_is_connected:
+            st.warning(
+                "⚠️ **Kite Disconnected** — showing only PENDING (queued) and historical "
+                "orders. Phantom OPEN orders generated without Kite confirmation are hidden. "
+                "Connect via ▶️ Start to see live positions."
+            )
+            # Remove OPEN orders that have no Kite confirmation (kite_buy_id is None).
+            # These are strategy signals that fired while Kite was offline.
+            _all_orders = [
+                o for o in _all_orders
+                if not (o.get("status") == "OPEN" and not o.get("kite_buy_id"))
+            ]
+
+        # ── Closed-market banner ───────────────────────────────────────────
+        if not _is_market_open():
+            _pending_count = sum(1 for o in _all_orders if o.get("status") == "PENDING")
+            if _pending_count:
+                st.info(
+                    f"🕐 Market is closed — {_pending_count} order(s) queued as **PENDING**. "
+                    "They will automatically become **OPEN** at next market open."
+                )
 
         # Portfolio positions keyed by (strat, sym_ns) for live-price enrichment
         _port_positions: dict = {}
@@ -1540,7 +1562,14 @@ if _page == "trading":
                 _oid     = _o.get("order_id", "")
 
                 _pos_obj = _port_positions.get((_strat_k, _sym_ns))
-                if _status == "OPEN" and _pos_obj:
+                if _status == "PENDING":
+                    # Order queued while market was closed — not yet filled
+                    _curr_s = "⏳ Awaiting open"
+                    _pnl_v  = None
+                    _pnl_md = "—"
+                    _sl_s   = "—"
+                    _tgt_md = "Queued"
+                elif _status == "OPEN" and _pos_obj:
                     # True only if the current tick provided a verified live price
                     # (excludes price-error symbols so they don't get the ✓ badge)
                     _is_live_price = (
@@ -1630,6 +1659,7 @@ if _page == "trading":
                     if _pnl_v is not None else "—"
                 )
                 _fg_st, _bg_st = {
+                    "PENDING":   ("#5a3e00", "#fff8e1"),
                     "OPEN":      ("#1a4f8a", "#dce8f8"),
                     "EXECUTED":  ("#145c2e", "#e6f9ee"),
                     "CANCELLED": ("#7a4800", "#fff3d4"),
@@ -1664,7 +1694,12 @@ if _page == "trading":
                 _row[8].write(_age)
                 _row[9].markdown(_status_md, unsafe_allow_html=True)
 
-                if _status == "OPEN":
+                if _status == "PENDING":
+                    if _row[10].button("✕ Cancel", key=f"cancel_{_oid}_{_strat_k}", type="secondary"):
+                        _bot_orders.log_cancel(_sym_ns, mode=_frag_mode)
+                        st.success(f"Cancelled pending order: {_sym_bare}")
+                        st.rerun()
+                elif _status == "OPEN":
                     if _row[10].button("✕ Close", key=f"close_{_oid}_{_strat_k}", type="secondary"):
                         if _frag_mode == "sim":
                             if _cur_sim_frag.force_close_position(_strat_k, _sym_ns):
@@ -2301,12 +2336,85 @@ elif _page == "settings":
                     st.success("✅ Saved for this session. Edit config.py to make permanent.")
                 st.markdown("""
 **How to get credentials:**
-1. [developers.kite.trade](https://developers.kite.trade/) → create an app (~₹2000/month)
-2. Each morning: `python zerodha_trader.py --generate-token`
+1. [developers.kite.trade](https://developers.kite.trade/) → create an app (~₹500/month)
+2. Each morning: `python main.py token`
 3. Paste the fresh Access Token here before starting the bot.
+
+**API surface used (yfinance handles all price data):**
+- `place_order` / `cancel_order` — order execution
+- `orders` / `order_history` — order status
+- `positions` — intraday holdings
+- `margins` — account balance
+- Historical Data and Full Quotes endpoints are **not called**.
                 """)
         except Exception as _e:
             st.error(f"Zerodha API error: {_e}")
+
+        try:
+            with st.expander("🛡️ SEBI Static-IP Compliance", expanded=True):
+                st.caption(
+                    "SEBI's April 2026 mandate requires algo-trading bots to run from a "
+                    "whitelisted static IP registered with your broker. Configure your "
+                    "allowed IPs below and click **Check Now** to verify compliance."
+                )
+                # Display current public IP
+                _cached_ip = st.session_state.get("_cached_public_ip", "—")
+                _ip_col1, _ip_col2 = st.columns([3, 1])
+                _ip_col1.markdown(
+                    f"**Current public IP:** `{_cached_ip}`",
+                )
+                if _ip_col2.button("🔍 Check Now", key=f"ip_check_{_k}"):
+                    with st.spinner("Fetching public IP…"):
+                        _fetched_ip = get_public_ip()
+                    if _fetched_ip:
+                        st.session_state["_cached_public_ip"] = _fetched_ip
+                        _allowed_list = [
+                            a.strip() for a in getattr(config, "ALLOWED_IPS", [])
+                            if a and a.strip()
+                        ]
+                        if not _allowed_list:
+                            st.warning(
+                                f"Current IP: **{_fetched_ip}**\n\n"
+                                "⚠️ `ALLOWED_IPS` is empty in `config.py` — "
+                                "IP check is disabled. Add your static IP(s) to enforce compliance."
+                            )
+                        elif _fetched_ip in _allowed_list:
+                            st.success(
+                                f"✅ IP compliance **PASSED** — `{_fetched_ip}` is whitelisted."
+                            )
+                            log_ip_once("dashboard_check")
+                        else:
+                            st.error(
+                                f"🚨 IP compliance **FAILED**\n\n"
+                                f"Current IP: `{_fetched_ip}`\n\n"
+                                f"Allowed IPs: `{_allowed_list}`\n\n"
+                                "Register this IP with Zerodha and add it to `config.ALLOWED_IPS`."
+                            )
+                    else:
+                        st.error("Could not determine public IP — check internet connectivity.")
+
+                # Allowed IPs editor
+                _current_ips = getattr(config, "ALLOWED_IPS", [])
+                _ips_str = st.text_area(
+                    "Allowed IPs (one per line)",
+                    value="\n".join(ip for ip in _current_ips if ip and ip.strip()),
+                    height=100,
+                    key=f"cfg_allowed_ips_{_k}",
+                    help="Add your home static IP and/or VPS IP. Separate with newlines.",
+                )
+                if st.button("💾 Save Allowed IPs", key=f"save_ips_{_k}"):
+                    _new_ips = [ip.strip() for ip in _ips_str.splitlines() if ip.strip()]
+                    config.ALLOWED_IPS = _new_ips
+                    st.success(
+                        f"✅ Saved {len(_new_ips)} IP(s) for this session. "
+                        "Edit `config.py` → `ALLOWED_IPS` to make permanent."
+                    )
+                st.caption(
+                    "📄 Audit trail written to `trade_data/live/audit_log.json` — "
+                    "IP is logged at startup and every hour while the bot runs."
+                )
+        except Exception as _e:
+            st.error(f"SEBI IP compliance error: {_e}")
     else:
         st.info("🔑 Zerodha API credentials and Live Trading Cap are only shown in **⚡ Live** mode. Toggle the switch in the sidebar to configure them.")
 

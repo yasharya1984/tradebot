@@ -24,6 +24,7 @@ from strategies import STRATEGY_MAP
 import trade_store
 import bot_orders
 from execution import Broker, SimBroker
+from market_utils import is_market_open as _is_market_open
 try:
     import tg_bot as _tg
 except Exception:
@@ -397,6 +398,11 @@ class Simulator:
 
         Returns dict with signals and portfolio state.
         """
+        # Promote any PENDING orders queued during market closure.
+        # This is a no-op when the market is closed or there are no pending orders.
+        if _is_market_open():
+            bot_orders.promote_pending_orders(self._trade_mode)
+
         if strategy_name not in self._paper_portfolios:
             self.initialize_paper_trading([strategy_name])
 

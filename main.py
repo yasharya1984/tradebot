@@ -18,6 +18,8 @@ from datetime import datetime, timezone, timedelta
 
 import config
 from data_fetcher import DataFetcher
+from ip_guard import verify_ip_compliance, log_ip_once, start_ip_heartbeat
+from market_utils import is_market_open as _market_is_open_util
 from stock_selector import StockSelector
 from simulator import Simulator
 from strategies import STRATEGY_MAP
@@ -111,11 +113,8 @@ MARKET_CLOSE = (15, 30)  # 3:30 PM IST
 
 
 def _market_is_open() -> bool:
-    """Return True if current IST time is within NSE market hours."""
-    now = datetime.now(IST)
-    open_dt  = now.replace(hour=MARKET_OPEN[0],  minute=MARKET_OPEN[1],  second=0)
-    close_dt = now.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0)
-    return open_dt <= now <= close_dt
+    """Return True if NSE market is currently open (weekdays, non-holidays, 9:15–15:30 IST)."""
+    return _market_is_open_util()
 
 
 def _run_one_tick(simulator: "Simulator") -> None:
@@ -142,6 +141,11 @@ def _build_broker_for_mode():
     mode = config.MODE.lower()
 
     if mode == "live":
+        # ── SEBI Static-IP compliance check ───────────────────
+        verify_ip_compliance()
+        # Start hourly IP heartbeat for audit trail
+        start_ip_heartbeat(interval_s=3600)
+
         from zerodha_trader import ZerodhaTrader
         if not config.ZERODHA_ACCESS_TOKEN:
             logger.error(
@@ -221,6 +225,13 @@ def cmd_paper():
                       f"(hours: {open_str}–{close_str} IST). Waiting...")
                 time.sleep(60)
                 continue
+
+            # Market is open — promote any orders queued during closure
+            import bot_orders as _bo
+            for _m in ("sim", "live"):
+                _n = _bo.promote_pending_orders(_m)
+                if _n:
+                    print(f"  → Promoted {_n} PENDING order(s) to OPEN [{_m}]")
 
             tick += 1
             print(f"\n{'='*60}")

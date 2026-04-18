@@ -275,7 +275,7 @@ Universe: 300 NSE symbols — 100 Large Cap, 100 Mid Cap, 100 Small Cap.
 
 > **Always run in simulation mode first before going live.**
 
-1. Apply for a Kite Connect API key at https://developers.kite.trade/ (approx ₹2000/month)
+1. Apply for a Kite Connect API key at https://developers.kite.trade/ (approx **₹500/month** for the Connect plan).
 2. Switch to ⚡ Live mode in the sidebar and go to **Settings → Zerodha API Credentials**. Enter your API key and secret there.
 3. Each morning before market open, generate a fresh access token:
    ```bash
@@ -284,7 +284,36 @@ Universe: 300 NSE symbols — 100 Large Cap, 100 Mid Cap, 100 Small Cap.
    Follow the login URL printed, copy the `request_token` from the redirect URL, paste it into `config.py`, and re-run the command.
 4. Toggle to ⚡ Live in the sidebar and start the bot from the Trading page.
 
-> SEBI requires an audit trail for algo trades. This bot logs all orders to `trade_data/live/orders.json`.
+### API surface
+
+Price data is sourced from **yfinance (free)**. The Kite Connect API is only called for:
+- `place_order` / `cancel_order`
+- `orders` / `order_history`
+- `positions`
+- `margins`
+
+Historical Data and Full Quotes endpoints (paid tiers) are **never called**.
+
+### SEBI Static-IP Compliance (April 2026 mandate)
+
+SEBI requires all algo-trading systems to operate from a **whitelisted static IP** registered with your broker and to maintain an **audit trail** of the machine's public IP.
+
+1. Obtain a static IP for your machine or VPS.
+2. Register it with Zerodha via your broker portal.
+3. Add it to `config.py`:
+   ```python
+   ALLOWED_IPS = ["203.0.113.10"]          # home static IP
+   # ALLOWED_IPS = ["203.0.113.10", "198.51.100.42"]  # home + VPS
+   ```
+4. On every live-mode startup the bot automatically:
+   - Fetches the current public IP and compares it against `ALLOWED_IPS`.
+   - Exits immediately with `"Insecure IP detected. Algo execution halted for compliance."` if the IPs don't match.
+   - Logs a startup record to `trade_data/live/audit_log.json`.
+   - Starts an hourly heartbeat that appends further IP records to the same file.
+
+You can also verify your IP at any time from **⚙️ Settings → SEBI Static-IP Compliance** in the dashboard.
+
+> SEBI requires an audit trail for algo trades. This bot logs all orders to `trade_data/live/orders.json` and all IP events to `trade_data/live/audit_log.json`.
 
 ---
 
@@ -294,10 +323,12 @@ Universe: 300 NSE symbols — 100 Large Cap, 100 Mid Cap, 100 Small Cap.
 trading_bot/
 ├── dashboard.py           # Streamlit dashboard (main UI)
 ├── main.py                # CLI entry point
-├── config.py              # All configuration settings
+├── config.py              # All configuration settings (incl. ALLOWED_IPS)
 ├── simulator.py           # Paper trading + backtest engine
 ├── zerodha_trader.py      # Zerodha Kite Connect wrapper
 ├── bot_orders.py          # Order log (read/write orders.json)
+├── ip_guard.py            # SEBI static-IP compliance & audit logging
+├── market_utils.py        # Shared NSE holiday calendar & market-hours logic
 ├── portfolio.py           # Portfolio state, dynamic exit logic
 ├── data_fetcher.py        # Yahoo Finance / Kite data fetcher
 ├── stock_selector.py      # Multi-strategy parallel scanner (4 scan strategies)
@@ -307,10 +338,12 @@ trading_bot/
 │   ├── moving_average.py  # MA crossover strategy
 │   ├── rsi_macd.py        # RSI + MACD strategy
 │   ├── momentum.py        # Momentum strategy
-│   └── trend_strength.py  # Trend-Strength strategy (RS + Volume + ADX)  ← NEW
+│   └── trend_strength.py  # Trend-Strength strategy (RS + Volume + ADX)
 └── trade_data/
     ├── sim/orders.json    # Paper trade order log
-    └── live/orders.json   # Live trade order log
+    └── live/
+        ├── orders.json    # Live trade order log
+        └── audit_log.json # SEBI IP audit trail (written by ip_guard.py)
 ```
 
 ---

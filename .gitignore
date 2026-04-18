@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Runtime / trade data
+trade_data/
+
+# Logs
+*.log
+
+# Environment & secrets
+.env
+*.env
+kite_access_token.txt
+access_token.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

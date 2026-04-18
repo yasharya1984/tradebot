@@ -31,11 +31,33 @@ MIN_PNL_TO_BOOK    = 200     # Minimum ₹200 P&L to execute a signal exit
 # ─────────────────────────────────────────────
 # ZERODHA KITE API CREDENTIALS
 # Get yours at: https://developers.kite.trade/
+# Cost: ₹500/month (Connect plan as of 2025)
+# Price data is sourced from yfinance (free) —
+#   the Kite API is used ONLY for:
+#     • place_order / cancel_order
+#     • order_history / orders
+#     • positions
+#     • margins (account balance)
+# No Historical Data or Full Quotes API calls are made.
 # ─────────────────────────────────────────────
 ZERODHA_API_KEY = "your_api_key_here"
 ZERODHA_API_SECRET = "your_api_secret_here"
 ZERODHA_ACCESS_TOKEN = ""    # Generated each day via login flow
 ZERODHA_REQUEST_TOKEN = ""   # Paste after OAuth redirect
+
+# ─────────────────────────────────────────────
+# SEBI STATIC-IP COMPLIANCE (April 2026 mandate)
+# SEBI requires algo-trading bots to run from a
+# whitelisted static IP registered with your broker.
+#
+# Add every authorised IP below.  An empty list means
+# the check is skipped (useful for simulation mode).
+# Typical setup: one home static IP + one VPS IP.
+#
+# Example:
+#   ALLOWED_IPS = ["203.0.113.10", "198.51.100.42"]
+# ─────────────────────────────────────────────
+ALLOWED_IPS: list = []   # e.g. ["your.static.ip.here"]
 
 # ─────────────────────────────────────────────
 # TRADING MODE
