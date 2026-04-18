@@ -9,16 +9,83 @@ An automated NSE (National Stock Exchange) day-trading bot with a Streamlit dash
 - **Dual-Mode Trading** — Run Simulation and Live modes simultaneously. Switch views with a toggle in the sidebar; each mode has fully independent settings, capital, and trade history.
 - **Paper Trading** — Simulate trades with virtual capital. All strategies run in parallel; positions and P&L tracked in real time. **Auto-starts on page load** if saved positions exist from a previous session.
 - **Live Trading** — Place real orders via Zerodha Kite Connect with a configurable capital cap.
-- **3 Trading Strategies** running in parallel:
+- **4 Trading Strategies** running in parallel:
   - `Moving Average Crossover` — Short/long MA crossover signals
   - `RSI + MACD` — Oversold/overbought RSI combined with MACD trend confirmation
   - `Momentum` — Price + volume momentum ranking
+  - `Trend-Strength` *(new)* — ADX-confirmed trends above SMA50 with MACD support; paired with the RS+Volume+ADX scanner
 - **Dynamic Exit Strategy** — Replaces static targets with a multi-phase trailing system (see below).
 - **Gap-Down Protection** — Timed exit logic that gives stocks a chance to recover before closing a position at the open.
 - **Position Sizing Guards** — Minimum ₹5,000 per position; minimum ₹200 P&L before booking a discretionary exit.
-- **Stock Screener** — Ranks stocks across a 300-symbol NSE universe (100 Large, 100 Mid, 100 Small cap) by momentum score.
+- **Multi-Strategy Parallel Scanner** — Runs 4 independent scan strategies across the 300-symbol NSE universe in a single batch fetch. Each strategy builds its own ranked candidate list; results are logged in a summary table after every scan. Orders are tagged with the originating `strategy_name` so the full audit trail is preserved in `orders.json`.
 - **Backtester** — Runs any strategy over historical data and compares performance across strategies.
 - **Streamlit Dashboard** — Live metrics, bot order log, portfolio status, screener results, backtest runner, and settings — all in one place.
+
+---
+
+## How Trades Are Selected (Multi-Strategy Parallel Scanning)
+
+Every session the bot runs **4 independent scan strategies** across the 300-symbol NSE universe using a single batch data fetch. Each strategy builds its own ranked candidate list. The same stock can appear in multiple strategy lists and is tagged with its originating `strategy_name` in every order record.
+
+After each scan, a summary table is logged:
+
+```
+Strategy [MA]:             23 selected  (LA: 8 | MI: 9 | SM: 6)
+Strategy [RSI_MACD]:       12 selected  (LA: 4 | MI: 5 | SM: 3)
+Strategy [MOMENTUM]:       31 selected  (LA: 11 | MI: 11 | SM: 9)
+Strategy [TREND_STRENGTH]:  0 selected
+[TrendStrength] Filter breakdown — RS failed: 45 | Volume failed: 89 | ADX<25: 120 | ...
+```
+
+---
+
+### Scanner 1 — MA (Moving Average Alignment)
+
+Selects stocks trading **above both SMA50 and SMA200**. Broadest filter — no volume or ADX requirement. Ranked by how far the price is above SMA200 (strongest structural uptrends first).
+
+- **Above SMA50**: near-term uptrend confirmed.
+- **Above SMA200**: long-term structural uptrend ("golden cross" zone).
+
+---
+
+### Scanner 2 — RSI_MACD (Momentum Confirmation)
+
+Selects stocks where:
+- **RSI(14) < 65** — not overbought/extended (room to run).
+- **MACD histogram > 0** — bullish momentum is actively building.
+
+Ranked by MACD histogram value. Catches stocks in the early stages of a momentum expansion before they become extended.
+
+---
+
+### Scanner 3 — Momentum (Price + Volume ROC)
+
+Selects stocks with a **positive composite momentum score** (weighted average of price ROC, short-term ROC, volume trend, and daily consistency). Ranked by score. Ideal for trend-following entries with rising institutional participation.
+
+---
+
+### Scanner 4 — Trend-Strength (RS + Volume + ADX) — *NEW*
+
+The most selective scanner. A stock must pass **all four gates**:
+
+| Gate | Condition | Purpose |
+|---|---|---|
+| RS | Price > SMA50 AND SMA200 | Long-term structural uptrend |
+| Volume | Volume ≥ 1.5× 20-day avg | Institutional conviction behind the move |
+| ADX | ADX(14) > 25 | Confirmed strong directional trend |
+| Volatility | Annualised vol ≤ 70% | Prevents whipsaw from high-volatility stocks |
+
+Ranked by ADX descending. When this scanner yields zero results (common on low-volume or choppy market days), the log shows a **granular per-filter breakdown** so you can see exactly which gate is eliminating stocks:
+
+```
+[TrendStrength] Filter breakdown — RS failed: 45 | Volume failed: 89 | ADX<25: 120 | Vol>70%: 3 | Data failed: 5 | Passed: 0
+```
+
+---
+
+### Tier Guarantee + Ranking
+
+All 4 scanners apply the same tier-guarantee system: at least **12 stocks from each cap tier** (Large / Mid / Small cap), with remaining slots filled by the globally highest-ranked stocks up to 60 total.
 
 ---
 
@@ -71,7 +138,7 @@ The sidebar is always visible (fixed, no collapse). The top of the sidebar has a
 | **Trading** | Start/stop the bot; live order table with exit-state indicators; portfolio status with per-strategy breakdown |
 | **Overview** | Equity curve, cumulative P&L, win rate summary across strategies |
 | **History** | Filterable trade history with export; exit reasons colour-coded by type |
-| **Screener** | Live momentum ranking of NSE 300 stocks with buy/sell signals |
+| **Screener** | RS + ADX filtered ranking of NSE 300 stocks — shows ADX, volume ratio, SMA50/200 vs price, and momentum score |
 | **Backtest** | Run strategies over a custom date range; compare total return, Sharpe, drawdown |
 | **Settings** | Adjust all risk, dynamic exit, and strategy parameters (independent per mode) |
 
@@ -185,13 +252,20 @@ Both modes run independently in parallel. Switching the toggle only changes whic
 | Moving Average | `MA_SHORT_PERIOD` (10), `MA_LONG_PERIOD` (30) |
 | RSI + MACD | `RSI_PERIOD` (14), `RSI_OVERSOLD` (35), `RSI_OVERBOUGHT` (65) |
 | Momentum | `MOMENTUM_LOOKBACK` (20 days), `MOMENTUM_VOLUME_LOOKBACK` (10 days) |
+| Trend-Strength | `RS_ADX_MIN` (25), `RS_SMA_SHORT` (50), `MACD_FAST/SLOW/SIGNAL` (12/26/9) |
 
-### Stock Universe
+### Stock Universe & Scanner Filters
 
-| Setting | Default |
-|---|---|
-| `TOP_N_STOCKS` | 60 (total stocks traded per session) |
-| `TOP_N_PER_CAP` | 12 (minimum from each cap tier) |
+| Setting | Default | Description |
+|---|---|---|
+| `TOP_N_STOCKS` | 60 | Total stocks traded per session |
+| `TOP_N_PER_CAP` | 12 | Minimum from each cap tier |
+| `RS_SMA_SHORT` | 50 | Price must be above N-day SMA |
+| `RS_SMA_LONG` | 200 | Price must be above N-day SMA |
+| `RS_VOLUME_LOOKBACK` | 20 | Days used for average volume baseline |
+| `RS_VOLUME_MULTIPLIER` | 1.5 | Current volume must be ≥ N× 20-day avg |
+| `RS_ADX_PERIOD` | 14 | ADX smoothing window (Wilder's method) |
+| `RS_ADX_MIN` | 25 | Minimum ADX to qualify as a trending stock |
 
 Universe: 300 NSE symbols — 100 Large Cap, 100 Mid Cap, 100 Small Cap.
 
@@ -218,24 +292,25 @@ Universe: 300 NSE symbols — 100 Large Cap, 100 Mid Cap, 100 Small Cap.
 
 ```
 trading_bot/
-├── dashboard.py          # Streamlit dashboard (main UI)
-├── main.py               # CLI entry point
-├── config.py             # All configuration settings
-├── simulator.py          # Paper trading + backtest engine
-├── zerodha_trader.py     # Zerodha Kite Connect wrapper
-├── bot_orders.py         # Order log (read/write orders.json)
-├── portfolio.py          # Portfolio state, dynamic exit logic
-├── data_fetcher.py       # Yahoo Finance / Kite data fetcher
-├── stock_selector.py     # Momentum-based stock screener
-├── trade_store.py        # Persistent trade history
+├── dashboard.py           # Streamlit dashboard (main UI)
+├── main.py                # CLI entry point
+├── config.py              # All configuration settings
+├── simulator.py           # Paper trading + backtest engine
+├── zerodha_trader.py      # Zerodha Kite Connect wrapper
+├── bot_orders.py          # Order log (read/write orders.json)
+├── portfolio.py           # Portfolio state, dynamic exit logic
+├── data_fetcher.py        # Yahoo Finance / Kite data fetcher
+├── stock_selector.py      # Multi-strategy parallel scanner (4 scan strategies)
+├── trade_store.py         # Persistent trade history
 ├── strategies/
-│   ├── base.py           # Abstract strategy interface
-│   ├── moving_average.py # MA crossover strategy
-│   ├── rsi_macd.py       # RSI + MACD strategy
-│   └── momentum.py       # Momentum strategy
+│   ├── base.py            # Abstract strategy interface
+│   ├── moving_average.py  # MA crossover strategy
+│   ├── rsi_macd.py        # RSI + MACD strategy
+│   ├── momentum.py        # Momentum strategy
+│   └── trend_strength.py  # Trend-Strength strategy (RS + Volume + ADX)  ← NEW
 └── trade_data/
-    ├── sim/orders.json   # Paper trade order log
-    └── live/orders.json  # Live trade order log
+    ├── sim/orders.json    # Paper trade order log
+    └── live/orders.json   # Live trade order log
 ```
 
 ---

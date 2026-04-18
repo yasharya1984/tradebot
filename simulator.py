@@ -23,6 +23,11 @@ from stock_selector import StockSelector
 from strategies import STRATEGY_MAP
 import trade_store
 import bot_orders
+from execution import Broker, SimBroker
+try:
+    import tg_bot as _tg
+except Exception:
+    _tg = None
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +56,11 @@ class Simulator:
         self.fetcher       = data_fetcher
         self.selector      = StockSelector(data_fetcher)
         self._paper_portfolios: Dict[str, Portfolio] = {}
-        self._paper_selected:   List[dict] = []
+        # _paper_selected_multi: keyed by strategy name → strategy-specific stock list.
+        # Populated lazily on the first paper_trading_tick() call.
+        self._paper_selected_multi: Dict[str, List[dict]] = {}
         self._trade_mode   = "sim"   # "sim" | "live", set by initialize_paper_trading
+        self._broker: Broker = SimBroker()  # default; overridden by initialize_paper_trading
 
     # ──────────────────────────────────────────────────────
     # BACKTEST: Single Strategy × Single Symbol
@@ -164,16 +172,31 @@ class Simulator:
         logger.info("Starting Full Strategy Comparison Backtest")
         logger.info("=" * 60)
 
-        # Select top stocks
-        selected, _ = self.selector.refresh_selection()
-        if not selected:
-            logger.error("No stocks selected")
+        # Select stocks for all strategies in one batch
+        selected_multi = self.selector.select_stocks_multi()
+        if not any(selected_multi.values()):
+            logger.error("No stocks selected by any strategy")
             return pd.DataFrame()
 
         rows = []
 
         for strategy_name in STRATEGY_MAP.keys():
             logger.info(f"\n── Strategy: {strategy_name.upper()} ──")
+
+            # Each strategy backtests on its own candidate pool
+            selected = selected_multi.get(strategy_name, [])
+            if not selected:
+                # Fall back to the union if this strategy produced no candidates
+                seen: Dict[str, dict] = {}
+                for stocks in selected_multi.values():
+                    for s in stocks:
+                        if s["symbol"] not in seen:
+                            seen[s["symbol"]] = s
+                selected = list(seen.values())
+                logger.info(
+                    f"  [{strategy_name}] no strategy-specific candidates; "
+                    f"using union ({len(selected)} stocks)"
+                )
 
             strategy_portfolios = []
             all_trades = []
@@ -228,8 +251,17 @@ class Simulator:
         strategy_name: str,
         period_days: int = BACKTEST_PERIOD_DAYS,
     ) -> Dict[str, BacktestResult]:
-        """Run one strategy on all selected stocks. Returns per-stock results."""
-        selected, _ = self.selector.refresh_selection()
+        """Run one strategy on its strategy-specific candidate pool. Returns per-stock results."""
+        selected_multi = self.selector.select_stocks_multi()
+        selected = selected_multi.get(strategy_name, [])
+        if not selected:
+            # Fall back to union
+            seen: Dict[str, dict] = {}
+            for stocks in selected_multi.values():
+                for s in stocks:
+                    if s["symbol"] not in seen:
+                        seen[s["symbol"]] = s
+            selected = list(seen.values())
         results = {}
 
         for stock_info in selected:
@@ -253,6 +285,7 @@ class Simulator:
         self,
         strategy_names: Optional[List[str]] = None,
         mode: str = "sim",
+        broker: Optional[Broker] = None,
     ):
         """
         Set up paper trading portfolios (one per strategy).
@@ -261,8 +294,18 @@ class Simulator:
         calls) so the dashboard can render the last-known portfolio without waiting
         for yfinance.  Stock selection is left empty here and populated lazily on
         the first call to paper_trading_tick() so the UI is never blocked.
+
+        Args:
+            strategy_names: Strategies to initialise (default: all).
+            mode:           "sim" or "live".  Controls which trade_data/ sub-dir
+                            is used for persistence.
+            broker:         Execution broker to use.  Pass a LiveBroker when
+                            mode="live"; defaults to SimBroker when omitted.
         """
         self._trade_mode = mode
+        # Wire the execution broker. If none supplied, default to SimBroker so
+        # callers that don't care about live trading never need to change.
+        self._broker = broker if broker is not None else SimBroker()
         names = strategy_names or list(STRATEGY_MAP.keys())
         for name in names:
             saved = trade_store.load_portfolio(name, mode=mode)
@@ -301,8 +344,8 @@ class Simulator:
         m = mode or self._trade_mode
         pf_count = trade_store.delete_all_portfolios(mode=m)
         ord_count = bot_orders.delete_all_orders(mode=m)
-        self._paper_portfolios = {}
-        self._paper_selected   = []
+        self._paper_portfolios     = {}
+        self._paper_selected_multi = {}
         logger.info(
             f"Paper trading RESET [{m}]: deleted {pf_count} portfolio(s), "
             f"{ord_count} order(s)"
@@ -335,8 +378,8 @@ class Simulator:
             return False
 
         pnl = trade.pnl
-        # Update order log
-        bot_orders.log_cancel(symbol, mode=self._trade_mode)
+        # Update order log via broker (works identically for sim and live)
+        self._broker.execute_cancel(symbol, mode=self._trade_mode)
         # Persist updated portfolio
         trade_store.save_portfolio(
             strategy_name, portfolio.to_dict(), mode=self._trade_mode
@@ -361,11 +404,26 @@ class Simulator:
         StrategyClass = STRATEGY_MAP[strategy_name]
         strategy = StrategyClass()
 
-        # Use the stock selection locked at startup — never re-scan mid-session
-        selected = getattr(self, "_paper_selected", None)
+        # Use the stock selection locked at startup — never re-scan mid-session.
+        # _paper_selected_multi is keyed by strategy name; populated lazily on
+        # the first tick so the dashboard can render without waiting for yfinance.
+        if not self._paper_selected_multi:
+            self._paper_selected_multi = self.selector.select_stocks_multi()
+
+        # Use strategy-specific candidates; fall back to union if none found.
+        selected = self._paper_selected_multi.get(strategy_name)
         if not selected:
-            self._paper_selected, _ = self.selector.refresh_selection()
-            selected = self._paper_selected
+            seen: Dict[str, dict] = {}
+            for stocks in self._paper_selected_multi.values():
+                for s in stocks:
+                    if s["symbol"] not in seen:
+                        seen[s["symbol"]] = s
+            selected = list(seen.values())
+            if selected:
+                logger.info(
+                    f"[{strategy_name}] no strategy-specific candidates; "
+                    f"falling back to union ({len(selected)} stocks)"
+                )
 
         tick_results = {}
         mode = self._trade_mode
@@ -469,7 +527,15 @@ class Simulator:
 
                 elif pos.gap_state not in ("watching", "recovered"):
                     # ── Dynamic Trailing Stop ─────────────────────────────
+                    _be_before = pos.breakeven_set
                     trailing_triggered = pos.update_trailing_stop(current_price)
+
+                    # Notify when break-even is first set
+                    if not _be_before and pos.breakeven_set and _tg:
+                        try:
+                            _tg.notify_breakeven(symbol, pos.entry_price)
+                        except Exception:
+                            pass
 
                     if trailing_triggered:
                         reason = "Trailing Stop"
@@ -481,7 +547,13 @@ class Simulator:
                         reason = "Strategy Signal"
                 else:
                     # gap_state == "watching" (still in opening window) or "recovered" — run normal checks
+                    _be_before = pos.breakeven_set
                     trailing_triggered = pos.update_trailing_stop(current_price)
+                    if not _be_before and pos.breakeven_set and _tg:
+                        try:
+                            _tg.notify_breakeven(symbol, pos.entry_price)
+                        except Exception:
+                            pass
                     if trailing_triggered:
                         reason = "Trailing Stop"
                     elif ema_exit:
@@ -492,24 +564,54 @@ class Simulator:
                 if reason:
                     trade = portfolio.close_position(symbol, current_price, reason)
                     if trade:
+                        # Unified execution: identical path for sim and live.
+                        # SimBroker logs to JSON; LiveBroker calls Kite then logs.
                         try:
-                            bot_orders.log_close(
-                                symbol, current_price, reason, trade.pnl, mode=mode
+                            self._broker.execute_sell(
+                                symbol, trade.quantity, current_price,
+                                reason, trade.pnl, mode,
                             )
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.error(f"execute_sell failed [{symbol}]: {exc}")
+                        # Push notification for exits
+                        if _tg:
+                            try:
+                                if reason == "Trailing Stop":
+                                    _tg.notify_tsl_triggered(symbol, current_price, trade.pnl)
+                                else:
+                                    bare = symbol.replace(".NS", "")
+                                    pnl_str = f"+₹{trade.pnl:,.0f}" if trade.pnl >= 0 else f"-₹{abs(trade.pnl):,.0f}"
+                                    emoji = "✅" if trade.pnl >= 0 else "❌"
+                                    _tg.send_notification(
+                                        f"{emoji} *{bare}* closed\n"
+                                        f"Exit: ₹{current_price:,.2f}  P&L {pnl_str}\n"
+                                        f"Reason: {reason}"
+                                    )
+                            except Exception:
+                                pass
 
-            # Process entries — log each open to bot_orders
+            # Process entries — unified execute_buy handles sim and live identically
             elif signal == "BUY":
                 new_pos = portfolio.open_position(symbol, current_price, strategy_name)
                 if new_pos:
                     try:
-                        bot_orders.log_open(
+                        self._broker.execute_buy(
                             symbol, new_pos.quantity, current_price,
-                            strategy_name, mode=mode,
+                            strategy_name, mode,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.error(f"execute_buy failed [{symbol}]: {exc}")
+                    # Push notification for entry
+                    if _tg:
+                        try:
+                            bare = symbol.replace(".NS", "")
+                            _tg.send_notification(
+                                f"🟢 *BUY {bare}*\n"
+                                f"Entry: ₹{current_price:,.2f}  ×{new_pos.quantity}\n"
+                                f"SL: ₹{new_pos.stop_loss:,.2f}  [{strategy_name.upper()}]"
+                            )
+                        except Exception:
+                            pass
 
             tick_results[symbol] = {
                 "signal":      signal,
@@ -624,6 +726,22 @@ class Simulator:
                 )
             except Exception:
                 pass
+            # Use the broker so the log entry mirrors however live orders are stored
+            try:
+                self._broker.execute_buy(
+                    symbol_ns, int(quantity), float(avg_price),
+                    strategy_name, "live",
+                )
+            except Exception:
+                # Fallback: at minimum log via bot_orders directly
+                try:
+                    bot_orders.log_open(
+                        symbol_ns, int(quantity), float(avg_price),
+                        strategy_name, mode="live",
+                        kite_order_id=pos.get("order_id"),
+                    )
+                except Exception:
+                    pass
             logger.info(
                 f"sync_live_portfolio: imported {symbol_kite} "
                 f"×{quantity} @ ₹{avg_price:.2f} into [{strategy_name}]"

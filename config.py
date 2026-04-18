@@ -41,6 +41,12 @@ ZERODHA_REQUEST_TOKEN = ""   # Paste after OAuth redirect
 # TRADING MODE
 # "simulation"  → paper trading (no real money)
 # "live"        → real orders via Zerodha Kite
+#
+# Switching MODE here is the ONLY change needed to go from sim to live.
+# The algorithm (entry/exit/TSL/P&L logic) is identical in both modes.
+# The execution.py Broker adapter handles the difference:
+#   SimBroker  → writes to trade_data/sim/
+#   LiveBroker → calls Kite API + writes to trade_data/live/
 # ─────────────────────────────────────────────
 MODE = "simulation"
 
@@ -53,10 +59,11 @@ LIVE_TRADING_CAP = 50_000    # INR — change to your desired cap
 
 # ─────────────────────────────────────────────
 # STRATEGY SELECTION
-# "ma"       → Moving Average Crossover
-# "rsi_macd" → RSI + MACD
-# "momentum" → Momentum
-# "all"      → Run all & compare (simulation only)
+# "ma"             → Moving Average Crossover
+# "rsi_macd"       → RSI + MACD
+# "momentum"       → Momentum
+# "trend_strength" → Trend-Strength (RS + Volume + ADX)  ← NEW
+# "all"            → Run all 4 in parallel & compare (simulation only)
 # ─────────────────────────────────────────────
 ACTIVE_STRATEGY = "all"
 
@@ -87,6 +94,18 @@ MOMENTUM_VOLUME_LOOKBACK = 10
 # ─────────────────────────────────────────────
 TOP_N_STOCKS = 60           # Total top stocks to trade per session
 TOP_N_PER_CAP = 12          # Minimum stocks from each cap tier (remaining filled by best score)
+
+# ─────────────────────────────────────────────
+# RELATIVE STRENGTH (RS) SCANNER FILTERS
+# Applied before momentum scoring to keep only
+# institutionally-trending stocks.
+# ─────────────────────────────────────────────
+RS_SMA_SHORT         = 50    # Price must be above 50-day SMA
+RS_SMA_LONG          = 200   # Price must be above 200-day SMA
+RS_VOLUME_LOOKBACK   = 20    # Days for average volume baseline
+RS_VOLUME_MULTIPLIER = 1.5   # Current volume must be >= 1.5× 20-day avg
+RS_ADX_PERIOD        = 14    # ADX period (Wilder's smoothing)
+RS_ADX_MIN           = 25    # Minimum ADX to qualify as a trending stock
 
 # ─────────────────────────────────────────────
 # NSE STOCK UNIVERSE — 300 stocks

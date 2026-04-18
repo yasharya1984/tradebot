@@ -1760,6 +1760,43 @@ elif _page == "overview":
         col3.metric("Total P&L", "₹0.00")
         col4.metric("Paper Ticks", "0")
 
+    # ── Open-order counts: sim vs live ───────────────────────────────────
+    st.divider()
+    _ov_c1, _ov_c2 = st.columns(2)
+
+    def _count_open_orders(mode: str) -> int:
+        """Count orders with status=OPEN for the given mode."""
+        return sum(
+            1 for o in _bot_orders.get_all_orders(mode=mode)
+            if o.get("status") == "OPEN"
+        )
+
+    _sim_open  = _count_open_orders("sim")
+    _live_open = _count_open_orders("live")
+
+    _ov_c1.markdown(
+        f'<div style="background:#dce8f8;border:1px solid #a8c8e8;border-radius:12px;'
+        f'padding:16px 20px;box-shadow:0 2px 8px rgba(26,79,138,0.08);text-align:center">'
+        f'<div style="color:#4a6080;font-size:0.78rem;font-weight:600">📊 Simulation Open Orders</div>'
+        f'<div style="color:#1a4f8a;font-weight:700;font-size:2rem;margin:6px 0">{_sim_open}</div>'
+        f'<div style="color:#6a8090;font-size:0.73rem">across all strategies in trade_data/sim/</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    _live_colour = "#145c2e" if _live_open > 0 else "#4a6080"
+    _live_bg     = "#e6f9ee" if _live_open > 0 else "#f4f8ff"
+    _live_bd     = "#a3d9b7" if _live_open > 0 else "#c0d4ec"
+    _ov_c2.markdown(
+        f'<div style="background:{_live_bg};border:1px solid {_live_bd};border-radius:12px;'
+        f'padding:16px 20px;box-shadow:0 2px 8px rgba(26,79,138,0.08);text-align:center">'
+        f'<div style="color:#4a6080;font-size:0.78rem;font-weight:600">⚡ Live Open Orders</div>'
+        f'<div style="color:{_live_colour};font-weight:700;font-size:2rem;margin:6px 0">{_live_open}</div>'
+        f'<div style="color:#6a8090;font-size:0.73rem">across all strategies in trade_data/live/</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
     st.info(
         "💡 Start the **📡 Trading** page to see live simulation results here. "
         "Run **📈 Backtest** from the sidebar to compare strategies on historical data."

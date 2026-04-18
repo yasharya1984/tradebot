@@ -21,6 +21,7 @@ from data_fetcher import DataFetcher
 from stock_selector import StockSelector
 from simulator import Simulator
 from strategies import STRATEGY_MAP
+from execution import build_broker
 
 # ─────────────────────────────────────────────
 # Logging setup
@@ -128,24 +129,87 @@ def _run_one_tick(simulator: "Simulator") -> None:
             print(f"  {sym:20s} {emoji} {info['signal']:6s} @ ₹{info['price']:,.2f}")
 
 
+def _build_broker_for_mode():
+    """
+    Build the execution broker matching config.MODE.
+
+    - "simulation" → SimBroker (paper trading, no real orders)
+    - "live"       → LiveBroker (real Zerodha orders)
+
+    For live mode the ZerodhaTrader is connected here; if connection fails
+    the function exits with a clear error rather than silently paper-trading.
+    """
+    mode = config.MODE.lower()
+
+    if mode == "live":
+        from zerodha_trader import ZerodhaTrader
+        if not config.ZERODHA_ACCESS_TOKEN:
+            logger.error(
+                "Live mode requires ZERODHA_ACCESS_TOKEN in config.py. "
+                "Run: python main.py token"
+            )
+            sys.exit(1)
+
+        trader = ZerodhaTrader(
+            config.ZERODHA_API_KEY,
+            config.ZERODHA_API_SECRET,
+            config.ZERODHA_ACCESS_TOKEN,
+        )
+        connected = trader.connect()
+        if not connected:
+            logger.error(
+                "Could not connect to Zerodha Kite. "
+                "Check your API key and access token."
+            )
+            sys.exit(1)
+
+        logger.info("Live mode: Zerodha connected. Building LiveBroker.")
+        return "live", trader, build_broker("live", trader)
+
+    # Default: simulation
+    return "sim", None, build_broker("sim")
+
+
 def cmd_paper():
-    """Run paper trading — one tick, or all day with --loop."""
+    """
+    Run trading loop (simulation or live) — one tick, or all day with --loop.
+
+    Mode is determined by config.MODE:
+      "simulation" → paper trading (SimBroker, no real orders)
+      "live"       → real Zerodha orders (LiveBroker)
+    """
     print_banner()
+
+    mode_str, trader, broker = _build_broker_for_mode()
+    trade_mode = "live" if mode_str == "live" else "sim"
 
     fetcher   = DataFetcher()
     simulator = Simulator(fetcher)
-    simulator.initialize_paper_trading()
+    simulator.initialize_paper_trading(mode=trade_mode, broker=broker)
+
+    # For live mode, sync any existing Kite positions before the first tick
+    if trade_mode == "live" and trader is not None:
+        for strat_name in STRATEGY_MAP:
+            result = simulator.sync_live_portfolio(strat_name, trader)
+            if result["positions_loaded"]:
+                logger.info(
+                    f"Synced {result['positions_loaded']} live position(s) "
+                    f"into [{strat_name}]"
+                )
 
     loop_mode = "--loop" in sys.argv
 
     if not loop_mode:
-        logger.info("Running single paper-trading tick...")
+        logger.info(f"Running single {trade_mode} tick...")
         _run_one_tick(simulator)
         return
 
     # ── Full-day loop ──────────────────────────────────────
     interval = config.DASHBOARD_REFRESH_SECONDS
-    logger.info(f"Paper trading loop started (interval: {interval}s). Press Ctrl+C to stop.")
+    logger.info(
+        f"Trading loop started [{trade_mode.upper()}] "
+        f"(interval: {interval}s). Press Ctrl+C to stop."
+    )
     tick = 0
     try:
         while True:
@@ -160,13 +224,16 @@ def cmd_paper():
 
             tick += 1
             print(f"\n{'='*60}")
-            print(f" Tick #{tick}  |  {now_ist.strftime('%d %b %Y  %H:%M:%S')} IST")
+            print(
+                f" Tick #{tick}  [{trade_mode.upper()}]  |  "
+                f"{now_ist.strftime('%d %b %Y  %H:%M:%S')} IST"
+            )
             print(f"{'='*60}")
             _run_one_tick(simulator)
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        print("\n\nStopped by user. Final portfolio state:")
+        print(f"\n\nStopped by user. Final {trade_mode} portfolio state:")
         _run_one_tick(simulator)
 
 
