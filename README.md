@@ -348,6 +348,148 @@ trading_bot/
 
 ---
 
+## Production Deployment (AWS Lightsail + Docker + mTLS)
+
+> Full step-by-step instructions are in [README_DEPLOY.md](README_DEPLOY.md).  
+> This section summarises the architecture and the pre-flight checklist.
+
+### Architecture
+
+```
+Your Browser (client.p12 installed)
+  │  HTTPS + Client Certificate (TLS 1.3)
+  ▼
+AWS Lightsail Static IP — Port 443
+  ▼ nginx:443  (validates client cert — returns 403 if missing)
+  ▼ trading-bot:8501  (internal Docker bridge — NOT exposed to internet)
+        ├─► yfinance  (free price data)
+        ├─► Zerodha Kite API  (order placement — static IP whitelisted)
+        ├─► GitHub REST API  (trade_data sync every 15 min)
+        └─► Telegram Bot API  (push notifications)
+```
+
+**Security layers:**  
+1. Lightsail firewall: port 443 restricted to your home IP only  
+2. Nginx mTLS: requires a valid `client.p12` — everyone else gets HTTP 403  
+3. Streamlit (8501): not exposed at all — internal Docker bridge only  
+4. All secrets in `.env` — never inside the Docker image  
+
+---
+
+### Keys and Secrets — What They Are and Where They're Used
+
+| Key | Where to get it | Used as | Purpose |
+|---|---|---|---|
+| `ZERODHA_API_KEY` | kite.trade → My Apps | env var | Identifies your Kite app |
+| `ZERODHA_API_SECRET` | kite.trade → My Apps | env var | Signs the OAuth session |
+| `ZERODHA_REQUEST_TOKEN` | Browser redirect after login | env var (daily) | Exchanges for access token |
+| `ZERODHA_ACCESS_TOKEN` | `python main.py token` | env var (daily) | Authorises every API call |
+| `TG_BOT_TOKEN` | @BotFather on Telegram | env var | Sends push notifications |
+| `TG_CHAT_ID` | Telegram API `getUpdates` | env var | Your private chat target |
+| `GITHUB_PAT` | github.com → Settings → Tokens | env var | Push trade_data to backup repo |
+| `GITHUB_REPO` | Your private repo name | env var | e.g. `username/trading-data` |
+| `ALLOWED_IPS` | Your Lightsail static IP | env var | SEBI static-IP compliance |
+| `ALGO_ID_PREFIX` | Choose any string (default `STRAT`) | env var | SEBI algo "license plate" |
+| `client.p12` | `./generate_certs.sh` | Browser Keychain | mTLS dashboard access |
+
+> `ZERODHA_REQUEST_TOKEN` and `ZERODHA_ACCESS_TOKEN` are regenerated **every morning** before 9:15 AM IST. All other secrets are set once.
+
+---
+
+### Pre-Deployment Checklist (Safe-to-Live)
+
+Before switching `TRADING_MODE=live` in `.env`, verify every item:
+
+**SEBI Compliance**
+- [ ] `ALLOWED_IPS` is set to your Lightsail static IP in `.env`
+- [ ] The same static IP is whitelisted in Zerodha Kite → My Apps → IP Whitelist
+- [ ] `ALGO_ID_PREFIX` is set (default `STRAT` is fine); prefix is registered with Zerodha
+- [ ] `trade_data/live/audit_log.json` is being written (run one sim tick to verify)
+
+**Authentication**
+- [ ] Fresh `ZERODHA_ACCESS_TOKEN` generated today via `python main.py token`
+- [ ] `ZERODHA_REQUEST_TOKEN` cleared from `.env` after token generation
+- [ ] Telegram test message received (`docker exec trading-bot python -c "from tg_bot import send_notification; send_notification('test')"`)
+
+**Infrastructure**
+- [ ] `docker ps` shows `trading-nginx`, `trading-bot`, `trading-mtls-watcher` all Up
+- [ ] `curl -k https://localhost` from the server returns **403** (mTLS enforced)
+- [ ] Dashboard loads in browser with client.p12 certificate prompt
+- [ ] GitHub sync working (`docker exec trading-bot python github_sync.py --push`)
+
+**Capital & Risk**
+- [ ] `LIVE_TRADING_CAP` set to a safe amount (default ₹50,000)
+- [ ] `CAPITAL` matches the actual funds available in your Zerodha account
+- [ ] Simulation has run for at least 3 consecutive trading days without crashes
+
+**Data Feed**
+- [ ] `PRICE_STALENESS_SECONDS=30` in `.env` (circuit breaker threshold)
+- [ ] Verified circuit breaker fires: manually backdate prices.json and confirm tick skips
+
+---
+
+### Daily Token Refresh (Every Morning Before 9:15 AM IST)
+
+```bash
+# 1. SSH into server
+ssh -i ~/.ssh/lightsail.pem ubuntu@<YOUR_STATIC_IP>
+
+# 2. Start the token flow (prints the Kite login URL)
+docker exec -it trading-bot python main.py token
+
+# 3. Open the printed URL in your browser, log in to Zerodha,
+#    copy the request_token from the redirect URL
+
+# 4. Set the request_token
+nano /opt/trading-bot/.env
+# ZERODHA_REQUEST_TOKEN=<paste_here>
+cd /opt/trading-bot && docker compose restart
+
+# 5. Generate the access token
+docker exec -it trading-bot python main.py token
+# Output: ✅ Access token: yyyyyyyyyyyy
+
+# 6. Apply the access token and clear the request token
+nano /opt/trading-bot/.env
+# ZERODHA_ACCESS_TOKEN=yyyyyyyyyyyy
+# ZERODHA_REQUEST_TOKEN=       ← clear this
+cd /opt/trading-bot && docker compose restart
+```
+
+> Set a daily alarm at **8:40 AM IST**. The whole flow takes ~2 minutes.
+
+---
+
+### Switching to Live Mode
+
+```bash
+nano /opt/trading-bot/.env
+# TRADING_MODE=live
+
+cd /opt/trading-bot && docker compose restart
+docker logs -f trading-bot   # watch for "Live mode: Zerodha connected"
+```
+
+The bot will:
+1. Check `ALLOWED_IPS` — exits immediately if IP is not whitelisted  
+2. Connect to Zerodha Kite with the access token  
+3. Start placing real MIS (intraday) orders up to `LIVE_TRADING_CAP`  
+4. Log every order to `trade_data/live/orders.json` and sync to GitHub every 15 min  
+
+### Updating the Bot
+
+```bash
+# Local machine: rebuild and push
+docker buildx build --platform linux/amd64 \
+    -t <YOUR_DOCKERHUB_USERNAME>/trading-bot:latest --push .
+
+# Server: pull and restart
+ssh -i ~/.ssh/lightsail.pem ubuntu@<YOUR_STATIC_IP>
+cd /opt/trading-bot && docker compose pull && docker compose up -d
+```
+
+---
+
 ## Disclaimer
 
 This bot is for personal educational use only. Trading stocks involves significant financial risk. Always test thoroughly in simulation mode before using real capital. The author is not responsible for any financial losses.

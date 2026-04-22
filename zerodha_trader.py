@@ -317,6 +317,7 @@ class ZerodhaTrader:
         quantity: int,
         order_type: str = "MARKET",
         price: Optional[float] = None,
+        tag: Optional[str] = None,
     ) -> Optional[str]:
         """
         Place a buy order on NSE.
@@ -326,6 +327,9 @@ class ZerodhaTrader:
             quantity:   Number of shares
             order_type: "MARKET" or "LIMIT"
             price:      Required if order_type="LIMIT"
+            tag:        SEBI algo "license plate" tag (e.g. "STRAT_ma").
+                        Passed as the Kite `tag` field — SEBI requires every
+                        algo-generated order to carry this identifier.
 
         Returns:
             order_id string if successful, None if failed
@@ -349,9 +353,14 @@ class ZerodhaTrader:
             }
             if order_type == "LIMIT" and price:
                 params["price"] = price
+            if tag:
+                params["tag"] = tag[:20]   # Kite enforces a 20-char max on tag
 
             order_id = self.kite.place_order(variety=self.kite.VARIETY_REGULAR, **params)
-            logger.info(f"✅ BUY order placed: {symbol} × {quantity} | order_id={order_id}")
+            logger.info(
+                f"✅ BUY order placed: {symbol} × {quantity} "
+                f"tag={tag!r} | order_id={order_id}"
+            )
             return str(order_id)
 
         except Exception as e:
@@ -364,8 +373,15 @@ class ZerodhaTrader:
         quantity: int,
         order_type: str = "MARKET",
         price: Optional[float] = None,
+        tag: Optional[str] = None,
     ) -> Optional[str]:
-        """Place a sell order."""
+        """
+        Place a sell order.
+
+        Args:
+            tag: SEBI algo "license plate" tag — same value used on the BUY leg
+                 so the exchange can pair entry/exit orders to the same algo.
+        """
         if not self._require_connected("place_sell_order"):
             return None
 
@@ -385,9 +401,14 @@ class ZerodhaTrader:
             }
             if order_type == "LIMIT" and price:
                 params["price"] = price
+            if tag:
+                params["tag"] = tag[:20]
 
             order_id = self.kite.place_order(variety=self.kite.VARIETY_REGULAR, **params)
-            logger.info(f"✅ SELL order placed: {symbol} × {quantity} | order_id={order_id}")
+            logger.info(
+                f"✅ SELL order placed: {symbol} × {quantity} "
+                f"tag={tag!r} | order_id={order_id}"
+            )
             return str(order_id)
 
         except Exception as e:

@@ -62,6 +62,10 @@ class Simulator:
         self._paper_selected_multi: Dict[str, List[dict]] = {}
         self._trade_mode   = "sim"   # "sim" | "live", set by initialize_paper_trading
         self._broker: Broker = SimBroker()  # default; overridden by initialize_paper_trading
+        # Incremented on every reset so in-flight tick threads can detect a
+        # mid-flight reset and skip the post-tick disk save (which would
+        # re-write stale portfolio data after the files were already deleted).
+        self._reset_epoch: int = 0
 
     # ──────────────────────────────────────────────────────
     # BACKTEST: Single Strategy × Single Symbol
@@ -343,6 +347,9 @@ class Simulator:
         Deletes on-disk state (portfolios + order log) and clears memory.
         """
         m = mode or self._trade_mode
+        # Bump the epoch FIRST so any in-flight tick thread sees the change
+        # before it tries to save its (now stale) portfolio to disk.
+        self._reset_epoch += 1
         pf_count = trade_store.delete_all_portfolios(mode=m)
         ord_count = bot_orders.delete_all_orders(mode=m)
         self._paper_portfolios     = {}
@@ -431,8 +438,40 @@ class Simulator:
                     f"falling back to union ({len(selected)} stocks)"
                 )
 
-        tick_results = {}
         mode = self._trade_mode
+
+        # ── Live-mode Circuit Breaker ──────────────────────────────────────
+        # If the last persisted prices.json is more than PRICE_STALENESS_SECONDS
+        # old the yfinance feed is lagging.  In live mode we must NOT place real
+        # orders on stale data.  Simulation mode always continues regardless.
+        if mode == "live":
+            from trade_store import is_price_data_stale
+            import config as _cfg
+            if is_price_data_stale(mode="live", max_age_seconds=_cfg.PRICE_STALENESS_SECONDS):
+                logger.warning(
+                    f"[{strategy_name}] CIRCUIT BREAKER OPEN — live price data is "
+                    f">{_cfg.PRICE_STALENESS_SECONDS}s stale. Skipping tick; "
+                    "no orders will be placed until data is fresh."
+                )
+                return {
+                    "strategy":    strategy_name,
+                    "timestamp":   datetime.now().isoformat(),
+                    "signals":     {},
+                    "portfolio":   {
+                        "cash":      round(portfolio.cash, 2) if portfolio else 0,
+                        "equity":    0,
+                        "pnl":       0,
+                        "pnl_pct":   0,
+                        "positions": 0,
+                    },
+                    "paused":      True,
+                    "pause_reason": "STALE_PRICE_DATA",
+                }
+
+        tick_results = {}
+        # Capture the epoch at tick start.  If a reset fires mid-tick we must
+        # not write stale data back to disk (that would undo the reset).
+        _epoch_at_start = self._reset_epoch
 
         # IST time — used for gap-down timed-exit logic
         IST = timezone(timedelta(hours=5, minutes=30))
@@ -568,13 +607,17 @@ class Simulator:
                         reason = "Strategy Signal"
 
                 if reason:
-                    trade = portfolio.close_position(symbol, current_price, reason)
+                    # Apply broker-specific execution price for the exit leg.
+                    # In SIM this slightly reduces the sell price (slippage);
+                    # in LIVE Kite determines the actual fill.
+                    exit_exec_price = self._broker.get_execution_price(current_price, "SELL")
+                    trade = portfolio.close_position(symbol, exit_exec_price, reason)
                     if trade:
                         # Unified execution: identical path for sim and live.
                         # SimBroker logs to JSON; LiveBroker calls Kite then logs.
                         try:
                             self._broker.execute_sell(
-                                symbol, trade.quantity, current_price,
+                                symbol, trade.quantity, exit_exec_price,
                                 reason, trade.pnl, mode,
                             )
                         except Exception as exc:
@@ -598,11 +641,14 @@ class Simulator:
 
             # Process entries — unified execute_buy handles sim and live identically
             elif signal == "BUY":
-                new_pos = portfolio.open_position(symbol, current_price, strategy_name)
+                # Apply broker-specific execution price (slippage + MPP in SIM;
+                # signal price in LIVE where Kite determines the actual fill).
+                exec_price = self._broker.get_execution_price(current_price, "BUY")
+                new_pos = portfolio.open_position(symbol, exec_price, strategy_name)
                 if new_pos:
                     try:
                         self._broker.execute_buy(
-                            symbol, new_pos.quantity, current_price,
+                            symbol, new_pos.quantity, exec_price,
                             strategy_name, mode,
                         )
                     except Exception as exc:
@@ -634,18 +680,26 @@ class Simulator:
         }
         portfolio._record_equity(current_prices)
 
-        # Persist portfolio state to disk so it survives app restarts
-        try:
-            trade_store.save_portfolio(strategy_name, portfolio.to_dict(), mode=mode)
-        except Exception as exc:
-            logger.warning(f"Failed to persist portfolio [{strategy_name}]: {exc}")
+        # Persist portfolio state to disk so it survives app restarts.
+        # Skip if a reset fired mid-tick — writing now would restore stale
+        # positions on top of the freshly-cleared disk state.
+        if self._reset_epoch == _epoch_at_start:
+            try:
+                trade_store.save_portfolio(strategy_name, portfolio.to_dict(), mode=mode)
+            except Exception as exc:
+                logger.warning(f"Failed to persist portfolio [{strategy_name}]: {exc}")
 
-        # Persist live prices so the dashboard can show them before the next
-        # tick completes (avoids falling back to entry prices on restart).
-        try:
-            trade_store.save_last_prices(current_prices, mode=mode)
-        except Exception as exc:
-            logger.warning(f"Failed to persist prices [{strategy_name}]: {exc}")
+            # Persist live prices so the dashboard can show them before the next
+            # tick completes (avoids falling back to entry prices on restart).
+            try:
+                trade_store.save_last_prices(current_prices, mode=mode)
+            except Exception as exc:
+                logger.warning(f"Failed to persist prices [{strategy_name}]: {exc}")
+        else:
+            logger.info(
+                f"paper_trading_tick [{strategy_name}]: skipping disk save — "
+                "simulation was reset mid-tick."
+            )
 
         return {
             "strategy":     strategy_name,

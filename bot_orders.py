@@ -169,6 +169,52 @@ def log_cancel(symbol: str, mode: str = "sim") -> None:
     logger.info(f"bot_orders: logged CANCEL {symbol} [{mode}]")
 
 
+def log_reject(
+    symbol: str,
+    quantity: int,
+    price: float,
+    strategy: str,
+    reason: str,
+    mode: str = "live",
+) -> str:
+    """
+    Record a broker-REJECTED order (live mode only).
+
+    Called when the Kite API raises an exception on place_order — e.g. due to
+    insufficient margin, price-band breach, or a compliance rejection.
+    The order is written immediately with status=REJECTED so the dashboard
+    and audit trail reflect the failure without showing a ghost OPEN position.
+
+    Returns the generated order_id.
+    """
+    orders = _load_raw(mode)
+    oid = str(uuid.uuid4())[:12]
+    orders.append({
+        "order_id":     oid,
+        "symbol":       symbol,
+        "side":         "BUY",
+        "quantity":     quantity,
+        "entry_price":  round(price, 2),
+        "exit_price":   None,
+        "strategy":     strategy,
+        "mode":         mode,
+        "status":       "REJECTED",
+        "placed_at":    datetime.now().isoformat(),
+        "opened_at":    None,
+        "closed_at":    datetime.now().isoformat(),
+        "exit_reason":  reason,
+        "pnl":          None,
+        "kite_buy_id":  None,
+        "kite_sell_id": None,
+    })
+    _save_raw(mode, orders)
+    logger.warning(
+        f"bot_orders: logged REJECTED {symbol} ×{quantity} @ ₹{price:.2f} "
+        f"reason={reason!r} [{mode}]"
+    )
+    return oid
+
+
 def promote_pending_orders(mode: str = "sim") -> int:
     """
     Transition all PENDING orders to OPEN now that the market has opened.

@@ -173,6 +173,54 @@ def load_last_prices(mode: str = "sim") -> dict:
         return {}
 
 
+def is_price_data_stale(mode: str = "live", max_age_seconds: int = 30) -> bool:
+    """
+    Circuit-breaker helper for live mode.
+
+    Returns True if the last prices saved to trade_data/{mode}/prices.json
+    are older than *max_age_seconds*.  The live trading tick should pause and
+    not place any orders when this returns True to avoid acting on stale data.
+
+    For simulation mode this always returns False — the sim can continue even
+    when prices haven't been refreshed recently (no real money at risk).
+
+    Args:
+        mode:            "sim" | "live"
+        max_age_seconds: Staleness threshold in seconds (default 30).
+
+    Returns:
+        True  → data is stale; caller should pause trading.
+        False → data is fresh (or mode is "sim").
+    """
+    if mode != "live":
+        return False   # sim never pauses on stale data
+
+    path = _prices_path(mode)
+    if not path.exists():
+        # No prices file yet — treat as stale on first live run
+        logger.warning("circuit_breaker: prices.json not found for live mode — treating as stale")
+        return True
+
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        saved_at_str = data.get("_saved_at")
+        if not saved_at_str:
+            return True   # malformed file — treat as stale
+        saved_at = datetime.fromisoformat(saved_at_str)
+        age_seconds = (datetime.now() - saved_at).total_seconds()
+        if age_seconds > max_age_seconds:
+            logger.warning(
+                f"circuit_breaker: live prices.json is {age_seconds:.0f}s old "
+                f"(threshold={max_age_seconds}s) — pausing trading tick"
+            )
+            return True
+        return False
+    except Exception as exc:
+        logger.error(f"circuit_breaker: error reading prices.json: {exc} — treating as stale")
+        return True
+
+
 def load_all_trade_history(mode: str = "sim") -> list:
     """
     Return a combined list of all closed trade dicts from every saved strategy

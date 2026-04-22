@@ -1161,20 +1161,24 @@ if _page == "trading":
 
     # ── Restart handler ───────────────────────────────────────
     if restart_btn:
+        # 1. Wipe all saved state (disk + memory)
         _cur_sim.reset_paper_trading(strategies_to_run, mode=_trade_mode)
-        st.session_state[f"paper_results_{_vm}"]       = {}
-        st.session_state[f"paper_ticks_{_vm}"]         = 0
-        st.session_state[f"paper_running_{_vm}"]       = False
+        st.session_state[f"paper_results_{_vm}"]   = {}
+        st.session_state[f"paper_ticks_{_vm}"]     = 0
+        if is_live:
+            st.session_state._kite_trader = None
+
+        # 2. Auto-start fresh — no need for the user to click Start manually
+        st.session_state[f"paper_running_{_vm}"]       = True
         st.session_state[f"_bg_thread_{_vm}"]          = None
         st.session_state[f"_bg_last_update_{_vm}"]     = None
         st.session_state[f"_tick_done_event_{_vm}"]    = threading.Event()
         st.session_state[f"_tick_result_{_vm}"]        = {}
-        st.session_state[f"_bot_start_time_{_vm}"]     = None
-        if is_live:
-            st.session_state._kite_trader = None
-        st.success(
-            f"✅ {'Live' if is_live else 'Simulation'} reset — all saved trades deleted. "
-            "Press ▶️ Start to begin fresh."
+        st.session_state[f"_bot_start_time_{_vm}"]     = datetime.now()
+        st.toast(
+            f"{'Live' if is_live else 'Simulation'} restarted — "
+            "all previous trades cleared, running fresh.",
+            icon="✅",
         )
 
     # ══════════════════════════════════════════════════════
@@ -1207,6 +1211,18 @@ if _page == "trading":
                 for _sr_v in _new_results.values():
                     for _sym_p, _info_p in _sr_v.get("signals", {}).items():
                         st.session_state[f"_cached_prices_{_mode}"][_sym_p] = _info_p["price"]
+                # Track feed health: offline when ≥80 % of signals report a price error.
+                _err_n = sum(
+                    1 for _sr in _new_results.values()
+                    for _sig in _sr.get("signals", {}).values()
+                    if _sig.get("price_error")
+                )
+                _tot_n = sum(
+                    len(_sr.get("signals", {})) for _sr in _new_results.values()
+                )
+                st.session_state[f"_feed_offline_{_mode}"] = (
+                    _tot_n > 0 and _err_n >= _tot_n * 0.8
+                )
             # Launch next tick if thread is idle
             _th = st.session_state.get(f"_bg_thread_{_mode}")
             if _th is None or not _th.is_alive():
@@ -1224,58 +1240,43 @@ if _page == "trading":
                 _t.start()
                 st.session_state[f"_bg_thread_{_mode}"] = _t
 
-        # ② Status bar for current view
+        # ② Tick state for current view
         _paper_running  = st.session_state.get(f"paper_running_{_frag_vm}", False)
         _last           = st.session_state.get(f"_bg_last_update_{_frag_vm}")
-        _thread         = st.session_state.get(f"_bg_thread_{_frag_vm}")
-        _fetch          = _thread is not None and _thread.is_alive()
-        _ts_str         = _last.strftime("%H:%M:%S") if _last else "—"
-        _ticks          = st.session_state.get(f"paper_ticks_{_frag_vm}", 0)
         _paper_results  = st.session_state.get(f"paper_results_{_frag_vm}", {})
 
-        # Show parallel-running badge if the OTHER mode is also active
-        _other_mode = "live" if _frag_vm == "sim" else "sim"
-        _other_running = st.session_state.get(f"paper_running_{_other_mode}", False)
-        _parallel_note = (
-            f" · {'⚡ Live' if _other_mode == 'live' else '📊 Sim'} also running in background"
-            if _other_running else ""
-        )
-
-        _price_state = st.session_state.get(f"_price_state_{_frag_vm}", "initial")
+        # ── Store next-sync deadline for the live countdown fragment ──
+        # The countdown fragment (_countdown_view) runs every 1 second and
+        # reads this value to compute remaining seconds in pure Python.
+        _price_state  = st.session_state.get(f"_price_state_{_frag_vm}", "initial")
         if _paper_running:
-            # Compute real time remaining until next auto-refresh
             _frag_refresh = int(st.session_state.get(
                 f"_refresh_secs_{_frag_vm}", refresh_secs
             ))
-            if _last:
-                _elapsed = (datetime.now() - _last).total_seconds()
-                _until_next = max(0, int(_frag_refresh - _elapsed))
-            else:
-                _until_next = _frag_refresh
-            _dot = "⟳ fetching…" if _fetch else "✓ live"
-
-            if _price_state == "initial":
-                _n_disk = len(st.session_state.get(f"_cached_prices_{_frag_vm}", {}))
-                if _n_disk > 0:
-                    st.info(
-                        f"🕐 **Showing last synced prices** ({_n_disk} symbols) — "
-                        "live refresh in progress in the background."
-                    )
-                else:
-                    st.info(
-                        "⏳ **Fetching live prices in background** — "
-                        "no prior sync found; values shown are entry prices until "
-                        "the first market sync completes."
-                    )
-            st.caption(
-                f"{_dot}  ·  Last update: {_ts_str}  "
-                f"·  Tick #{_ticks}  "
-                f"·  Next refresh in ~{_until_next}s"
-                + ("  ·  📡 Prices: cached" if _price_state == "initial" else "  ·  📡 Prices: live")
-                + _parallel_note
+            _until_next = (
+                max(0, int(_frag_refresh - (datetime.now() - _last).total_seconds()))
+                if _last else _frag_refresh
             )
-        elif _ticks > 0 or _paper_results:
-            st.caption(f"⏸ Paused  ·  Last update: {_ts_str}  ·  Tick #{_ticks}{_parallel_note}")
+            st.session_state[f"_next_sync_deadline_{_frag_vm}"] = (
+                datetime.now() + timedelta(seconds=_until_next)
+            )
+        else:
+            st.session_state.pop(f"_next_sync_deadline_{_frag_vm}", None)
+
+        # Price-state info banners (only when running and not yet synced)
+        if _paper_running and _price_state == "initial":
+            _n_disk = len(st.session_state.get(f"_cached_prices_{_frag_vm}", {}))
+            if _n_disk > 0:
+                st.info(
+                    f"🕐 **Showing last synced prices** ({_n_disk} symbols) — "
+                    "live refresh in progress in the background."
+                )
+            else:
+                st.info(
+                    "⏳ **Fetching live prices in background** — "
+                    "no prior sync found; values shown are entry prices until "
+                    "the first market sync completes."
+                )
 
         if not _paper_results:
             if not _paper_running:
@@ -1789,6 +1790,61 @@ if _page == "trading":
         )
         st.plotly_chart(_fig_eq, use_container_width=True)
 
+    # ── Status bar: runs every 1 second, pure Python, no JS ──────────
+    # All state is read from session_state (set by _paper_live_view).
+    # Called FIRST so it renders above the charts.
+    @st.fragment(run_every=1)
+    def _countdown_view():
+        _cvm        = st.session_state.get("_view_mode", "sim")
+        _clive      = (_cvm == "live")
+        _crunning   = st.session_state.get(f"paper_running_{_cvm}", False)
+        _cprice_st  = st.session_state.get(f"_price_state_{_cvm}", "initial")
+        _cfeed_off  = st.session_state.get(f"_feed_offline_{_cvm}", False)
+        _clast      = st.session_state.get(f"_bg_last_update_{_cvm}")
+
+        if _cprice_st == "initial":
+            _cdot, _cfeed_text = "#94a3b8", "Initializing"
+        elif _cfeed_off:
+            _cdot, _cfeed_text = "#ef4444", "✗ Feed Offline"
+        else:
+            _cdot, _cfeed_text = "#22c55e", "Operational"
+
+        _csync   = _clast.strftime("%H:%M:%S") if _clast else "Pending"
+        _cmode   = "⚡ Live" if _clive else "📊 Simulation"
+        _cother  = "live" if _cvm == "sim" else "sim"
+        _cparallel = (
+            f"&nbsp;·&nbsp;{'⚡ Live' if _cother == 'live' else '📊 Sim'}"
+            " also running"
+            if st.session_state.get(f"paper_running_{_cother}", False) else ""
+        )
+
+        if not _crunning:
+            _crefresh = "&#9208;&nbsp;Paused"
+        else:
+            _dead = st.session_state.get(f"_next_sync_deadline_{_cvm}")
+            if _dead:
+                _secs = max(0, int((_dead - datetime.now()).total_seconds()))
+                _crefresh = f"Refresh in:&nbsp;<strong>{_secs}s</strong>"
+            else:
+                _crefresh = "Refresh in:&nbsp;<strong>…</strong>"
+
+        _csep = '<span style="margin:0 8px;opacity:0.35">|</span>'
+        st.html(
+            f'<div style="font-family:inherit;font-size:0.85rem;line-height:2;'
+            f'color:rgba(49,51,63,0.72);border-top:1px solid rgba(49,51,63,0.1);'
+            f'padding-top:4px;display:flex;align-items:center;flex-wrap:wrap;">'
+            f'<span style="color:{_cdot};font-size:0.65rem;margin-right:5px;">●</span>'
+            f'<span>Market Feed:&nbsp;<strong>{_cfeed_text}</strong></span>'
+            f'{_csep}'
+            f'<span>Sync:&nbsp;<strong>{_csync}</strong></span>'
+            f'{_csep}'
+            f'<span>{_crefresh}</span>'
+            f'{_csep}'
+            f'<span>{_cmode}{_cparallel}</span>'
+            f'</div>'
+        )
+
+    _countdown_view()
     _paper_live_view()
 
 

@@ -68,6 +68,48 @@ _allowed_ips_env = os.environ.get("ALLOWED_IPS", "")
 ALLOWED_IPS: list = [ip.strip() for ip in _allowed_ips_env.split(",") if ip.strip()]
 
 # ─────────────────────────────────────────────
+# SEBI ALGO-ID "LICENSE PLATE" TAGGING
+# SEBI circular (2024) requires every algo order
+# to carry an algo identifier tag so the exchange
+# can trace which registered algorithm generated it.
+#
+# ALGO_ID_PREFIX is prepended to the strategy name:
+#   "STRAT_ma", "STRAT_rsi_macd", etc.
+# Register this prefix with Zerodha under your Kite
+# app settings before going live.
+# ─────────────────────────────────────────────
+ALGO_ID_PREFIX = os.environ.get("ALGO_ID_PREFIX", "STRAT")
+
+# ─────────────────────────────────────────────
+# SIMULATION EXECUTION REALISM
+# These settings make the SIM fill prices match
+# what the LIVE bot actually experiences.
+#
+# SIM_SLIPPAGE_PCT  – bid-ask spread penalty applied
+#   to every simulated fill:  BUY @ price × (1 + pct)
+#                             SELL @ price × (1 − pct)
+#   Default 0.05% matches the typical NSE large-cap
+#   spread seen in the Kite live feed.
+#
+# SIM_MPP_PCT  – SEBI Market Price Protection band.
+#   SEBI now converts MARKET orders to limit orders
+#   at ±0.5%–1% from the last traded price.  The
+#   simulation adds half this band (0.5%) on top of
+#   slippage to model the worst-case MPP fill.
+# ─────────────────────────────────────────────
+SIM_SLIPPAGE_PCT = float(os.environ.get("SIM_SLIPPAGE_PCT", "0.0005"))   # 0.05%
+SIM_MPP_PCT      = float(os.environ.get("SIM_MPP_PCT",      "0.005"))    # 0.5%
+
+# ─────────────────────────────────────────────
+# DATA FEED CIRCUIT BREAKER
+# In LIVE mode, if the last persisted prices.json
+# is older than this many seconds the trading tick
+# is paused and no orders are placed.
+# SIM mode never pauses — it can run on stale data.
+# ─────────────────────────────────────────────
+PRICE_STALENESS_SECONDS = int(os.environ.get("PRICE_STALENESS_SECONDS", "30"))
+
+# ─────────────────────────────────────────────
 # TRADING MODE
 # "simulation"  → paper trading (no real money)
 # "live"        → real orders via Zerodha Kite

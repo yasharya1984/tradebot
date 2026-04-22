@@ -27,8 +27,8 @@ ZERODHA_API_KEY="your_kite_api_key"
 ZERODHA_API_SECRET="your_kite_api_secret"
 TRADING_MODE="simulation"               # change to "live" when ready
 
-GITHUB_PAT="ghp_xxxxxxxxxxxxxxxxxxxx"
-GITHUB_REPO="your-github-username/trading-data"
+GITHUB_PAT="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # your GitHub PAT token, NOT a URL
+GITHUB_REPO="yasharya1984/trading-data"
 GITHUB_BRANCH="main"
 
 TG_BOT_TOKEN="1234567890:AAxxxxxxxxxxxxxxxxxx"
@@ -237,16 +237,38 @@ echo "  ✓ docker-compose.yml and nginx.conf written"
 echo "=== [4/7] Writing .env file ==="
 cat > "$INSTALL_DIR/.env" << ENV_EOF
 DOCKER_IMAGE=${DOCKER_IMAGE}
+
+# Zerodha Kite API
 ZERODHA_API_KEY=${ZERODHA_API_KEY}
 ZERODHA_API_SECRET=${ZERODHA_API_SECRET}
 ZERODHA_ACCESS_TOKEN=
+ZERODHA_REQUEST_TOKEN=
+
+# Trading mode
 TRADING_MODE=${TRADING_MODE}
+
+# SEBI static-IP compliance — fill in after Lightsail static IP is assigned
 ALLOWED_IPS=
+
+# SEBI algo license-plate tag (register STRAT prefix with Zerodha Kite)
+ALGO_ID_PREFIX=STRAT
+
+# GitHub data backup
 GITHUB_PAT=${GITHUB_PAT}
 GITHUB_REPO=${GITHUB_REPO}
 GITHUB_BRANCH=${GITHUB_BRANCH}
+
+# Telegram notifications
 TG_BOT_TOKEN=${TG_BOT_TOKEN}
 TG_CHAT_ID=${TG_CHAT_ID}
+DEDUP_WINDOW_SECONDS=60
+
+# Simulation realism (does not affect live fills)
+SIM_SLIPPAGE_PCT=0.0005
+SIM_MPP_PCT=0.005
+
+# Data feed circuit breaker (live mode only)
+PRICE_STALENESS_SECONDS=30
 ENV_EOF
 chmod 600 "$INSTALL_DIR/.env"
 echo "  ✓ .env written (permissions: 600)"
